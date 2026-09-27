@@ -120,13 +120,59 @@ async def test_refresh_rotates_and_invalidates_old_token(client: AsyncClient, us
     rotated = first.json()["refresh_token"]
     assert rotated != original
 
+    # Replaying a token that was rotated past is the theft signal, and is
+    # reported distinctly from a plain revocation.
     replay = await client.post("/auth/refresh", json={"refresh_token": original})
     assert replay.status_code == 401
-    assert replay.json()["error"]["code"] == "refresh_token_revoked"
+    assert replay.json()["error"]["code"] == "refresh_token_reuse_detected"
 
     rotated_access = first.json()["access_token"]
     me = await client.get("/auth/me", headers={"Authorization": f"Bearer {rotated_access}"})
     assert me.status_code == 200
+
+
+async def test_reusing_a_rotated_token_revokes_the_whole_chain(
+    client: AsyncClient, user
+) -> None:
+    login = await client.post(
+        "/auth/login", json={"email": user.email, "password": "Passw0rd!"}
+    )
+    original = login.json()["tokens"]["refresh_token"]
+
+    first = await client.post("/auth/refresh", json={"refresh_token": original})
+    assert first.status_code == 200
+    successor = first.json()["refresh_token"]
+
+    replay = await client.post("/auth/refresh", json={"refresh_token": original})
+    assert replay.status_code == 401
+    assert replay.json()["error"]["code"] == "refresh_token_reuse_detected"
+
+    # The successor is collateral damage: once a superseded token comes back the
+    # whole chain is untrustworthy, so the honest user is signed out too.
+    after = await client.post("/auth/refresh", json={"refresh_token": successor})
+    assert after.status_code == 401
+    assert after.json()["error"]["code"] == "refresh_token_revoked"
+
+
+async def test_reuse_detection_is_scoped_to_one_session(client: AsyncClient, user) -> None:
+    first_login = await client.post(
+        "/auth/login", json={"email": user.email, "password": "Passw0rd!"}
+    )
+    second_login = await client.post(
+        "/auth/login", json={"email": user.email, "password": "Passw0rd!"}
+    )
+    compromised = first_login.json()["tokens"]["refresh_token"]
+    unrelated = second_login.json()["tokens"]["refresh_token"]
+
+    rotated = await client.post("/auth/refresh", json={"refresh_token": compromised})
+    assert rotated.status_code == 200
+    replay = await client.post("/auth/refresh", json={"refresh_token": compromised})
+    assert replay.status_code == 401
+    assert replay.json()["error"]["code"] == "refresh_token_reuse_detected"
+
+    # A separate login is a separate family and must survive the burn.
+    survivor = await client.post("/auth/refresh", json={"refresh_token": unrelated})
+    assert survivor.status_code == 200, survivor.text
 
 
 async def test_logout_revokes_refresh_token(client: AsyncClient, user) -> None:
@@ -136,6 +182,8 @@ async def test_logout_revokes_refresh_token(client: AsyncClient, user) -> None:
     token = login.json()["tokens"]["refresh_token"]
     assert (await client.post("/auth/logout", json={"refresh_token": token})).status_code == 200
 
+    # A token revoked by an explicit logout has no successor, so replaying it
+    # stays a plain revocation and does not escalate to reuse detection.
     replay = await client.post("/auth/refresh", json={"refresh_token": token})
     assert replay.status_code == 401
     assert replay.json()["error"]["code"] == "refresh_token_revoked"

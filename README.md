@@ -7,7 +7,7 @@ gateway with an idempotent webhook receiver.
 - **Stack:** FastAPI, async SQLAlchemy 2, Alembic, PostgreSQL (`asyncpg`),
   Redis cache, Celery worker, JWT auth, Pydantic v2
 - **Interactive docs:** `/docs` (Swagger), `/redoc`
-- **Tests:** 124 passing, run against SQLite by default or PostgreSQL with
+- **Tests:** 126 passing, run against SQLite by default or PostgreSQL with
   `TEST_DATABASE_URL`
 - **Requires:** Python 3.11+ (developed on 3.14), PostgreSQL 14+ or SQLite 3.35+
 
@@ -62,7 +62,7 @@ Regular users can browse the catalogue, book tests, and pay for bookings.
 | `POST`   | `/auth/signup`                              | Register and receive a token pair             |
 | `POST`   | `/auth/login`                               | JSON login                                    |
 | `POST`   | `/auth/token`                               | OAuth2 password flow (form encoded)           |
-| `POST`   | `/auth/refresh`                             | Rotate a refresh token                        |
+| `POST`   | `/auth/refresh`                             | Rotate a refresh token (revokes the family on reuse) |
 | `POST`   | `/auth/logout`                              | Revoke a refresh token                        |
 | `GET`    | `/auth/me`                                  | Current user                                  |
 | `GET`    | `/auth/config`                              | Non-sensitive runtime settings                |
@@ -122,6 +122,78 @@ curl -s -X POST $BASE/payments/webhook/ -H 'Content-Type: application/json' \
   -d "$(jq -c .webhook payment.json)" | jq '{event_id, duplicate, booking_status}'
 # { "event_id": "evt_...", "duplicate": true, "booking_status": "CONFIRMED" }
 ```
+
+## Authentication and session security
+
+Signup and login both return an access token and a refresh token. The access
+token is a short-lived signed JWT; the refresh token is longer-lived, single-use,
+and tracked server-side so it can be rotated and revoked.
+
+### What is stored, and what that buys
+
+| Stored | Never stored |
+| --- | --- |
+| `jti` (random `uuid4` hex), `family_id`, `user_id`, `expires_at`, `revoked_at`, `replaced_by_jti`, `user_agent` | the refresh token itself, the password |
+
+Decisions behind that:
+
+- **The raw refresh token is never persisted.** Only the `jti` is, so a database
+  leak yields material that cannot be presented as a credential. This is also
+  why I did *not* add hashing of the token at rest: there is no plaintext token
+  in the table to hash. A hash of a value that is never stored adds a lookup
+  indirection without removing a risk, so it would be security theatre.
+- **Authorization never trusts a token claim.** The access token does carry
+  `is_admin`, but only as display metadata. `get_current_user`
+  (`app/api/deps.py`) reloads the user on every request and `get_current_admin`
+  checks `user.is_admin` on that row. Deactivating a user or stripping admin
+  therefore takes effect on the next request instead of waiting out the token
+  lifetime. This costs one query per request, which is the right trade on an
+  admin surface.
+- **Token types are enforced.** `access` and `refresh` are distinguished by the
+  `type` claim, and every entry point requires the type it expects, so a refresh
+  token cannot be replayed as a bearer credential.
+- **Passwords** are bcrypt at cost 12 via passlib, compared in constant time, and
+  never logged.
+
+### Rotation, families, and reuse detection
+
+Every `POST /auth/refresh` revokes the presented token and issues a successor
+carrying the same `family_id`. A family is one login's rotation chain.
+
+Presenting a token that was **already rotated past** is the signature of a stolen
+token being replayed, or a client racing its own rotation. The response is `401`
+`refresh_token_reuse_detected`, and every live token in that family is revoked,
+so attacker and honest user are both signed out and the user re-authenticates.
+
+Replaying a token revoked by an explicit `POST /auth/logout` is deliberately
+**not** escalated to reuse detection. Such a token has no successor, and "logged
+out, then retried" is a client quirk rather than a compromise; burning every
+session over it would be a self-inflicted denial of service.
+`replaced_by_jti` is what distinguishes the two cases and is the only reason
+that column exists.
+
+Blast radius is one family: a second login for the same user is a separate family
+and is unaffected.
+
+### One subtlety worth flagging
+
+The request-scoped session is rolled back on any exception
+(`app/db/session.py`). The family revocation is therefore committed *inside*
+`_revoke_token_family` before the `401` is raised. Without that, the rollback
+would silently discard the security response and the attacker would keep a
+working token while the request appeared to have worked. This is the one place
+where the service layer commits instead of leaving it to the router, and the
+reason is worth more than the layering purity it costs.
+
+Verified against PostgreSQL 18:
+
+- rotating then replaying the original returns `refresh_token_reuse_detected`
+- the successor issued by that rotation is revoked in the same response, which
+  is what proves the commit survived the `401`
+- a second, independent login still returns `200` from `/auth/refresh`
+- replaying a logged-out token still returns the plain `refresh_token_revoked`
+- the `family_id` backfill on upgrade seeds each pre-existing token as its own
+  family, so enabling detection can never revoke an unrelated live session
 
 ## Domain model and state machines
 
@@ -211,6 +283,12 @@ SQLite. `(centre_id, test_id)` on `centre_tests` is the composite primary key
 rather than a separate unique constraint, because PostgreSQL collapses a unique
 constraint with the same columns into the primary key index anyway.
 
+`7c1f4a9b2d38` adds `refresh_tokens.family_id`. It is added nullable, backfilled
+from `jti`, then made `NOT NULL`, because SQLite cannot alter a column to
+`NOT NULL` in place; `batch_alter_table` recreates the table there and is a
+no-op on PostgreSQL. The upgrade, downgrade, and re-upgrade paths were all
+executed against both databases, with pre-existing rows in place.
+
 ## Error format
 
 Every failure uses one envelope, with a `request_id` that also appears in the
@@ -227,10 +305,16 @@ Every failure uses one envelope, with a `request_id` that also appears in the
 `400` validation, `401` auth, `403` ownership/admin, `404` missing, `409` state
 or uniqueness conflicts, `422` request validation, `429` rate limited.
 
+Two `401` codes on `/auth/refresh` are deliberately distinct:
+`refresh_token_revoked` for a token that was logged out or already spent, and
+`refresh_token_reuse_detected` for a token that was rotated past and has come
+back, which additionally revokes the whole token family. See
+*Authentication and session security*.
+
 ## Testing
 
 ```bash
-make test                                        # SQLite in-memory, 124 tests
+make test                                        # SQLite in-memory, 126 tests
 make lint                                        # ruff over app, tests, alembic
 
 # PostgreSQL: the suite creates and drops its own schema, so point it at an
@@ -241,7 +325,7 @@ make test-postgres                               # or override the target:
 make test-postgres TEST_PG_URL=postgresql+asyncpg://eve@127.0.0.1:5432/eve_diagnostics_test
 ```
 
-All 124 tests pass on **both** SQLite and PostgreSQL 18. Running them against
+All 126 tests pass on **both** SQLite and PostgreSQL 18. Running them against
 PostgreSQL matters: it exercises `SELECT ... FOR UPDATE`, the
 `INSERT ... ON CONFLICT DO NOTHING` event claim, and the partial unique index,
 none of which SQLite actually enforces. SQLite silently ignores `FOR UPDATE` and
@@ -322,7 +406,9 @@ The assignment left several things open. These are the calls I made and why.
 8. **Signup returns a token pair.** The brief only requires signup and login, but
    not making a new user call login immediately is poor UX.
 9. **Refresh tokens are persisted, not stateless.** That is what makes rotation
-   and revocation possible, and reuse of a rotated token is detectable.
+   and revocation possible. Only the `jti` is stored, never the token, and each
+   rotation inherits a `family_id` so that reuse of a superseded token can burn
+   exactly that login chain. See *Authentication and session security*.
 10. **SQLite is a development convenience, PostgreSQL is the target.** The
     PostgreSQL-only partial index is the real double-capture guard, so PG is the
     only database where the full guarantee is enforced by the database itself.
@@ -337,8 +423,11 @@ Ordered by value, not by how interesting they are.
    simulated event are written in one transaction, which is fine for an
    in-process mock. Against a real gateway, "create payment" and "receive
    webhook" cannot share a transaction, so a transactional outbox plus a
-   delivery worker is the correct shape. This is the change I would want to be
-   asked to make live.
+   delivery worker is the correct shape. This is the highest-value change here
+   by a wide margin, and also the largest: a new table, a publisher, and a
+   restructuring of the payment transaction. I would not attempt it as a
+   timed "small change" exercise. A good live change in this codebase is
+   refresh-token reuse detection, which is what I implemented.
 2. **Outsourced auth.** Password hashing and JWT rotation are hand-rolled here
    deliberately, to show the mechanics. In production this should be a proven
    library or an identity provider, with key rotation and JWKS.
@@ -353,9 +442,13 @@ Ordered by value, not by how interesting they are.
 6. **Email verification, password reset, and MFA** on top of the existing auth.
 7. **Observability beyond logs.** Correlation IDs already exist; adding request
    metrics, latency histograms, and tracing would make the bonus points real.
-8. **Refresh-token storage hardening.** Hashing the token at rest and adding a
-   short-lived "session" abstraction would reduce the blast radius of a
-   database leak.
+8. **Signing key rotation.** Tokens are signed with a single symmetric
+   `JWT_SECRET_KEY`, so there is no `kid` and no way to roll a key without
+   invalidating every session. Asymmetric signing with a published JWKS, and a
+   `kid` header so old keys can be retired gradually, is the fix. Note this
+   replaces the "hash the token at rest" idea I had listed previously: since
+   the raw token is never stored, that would have protected nothing. Token
+   *families* now provide the session abstraction that item was reaching for.
 9. **Contract tests for the webhook schema.** A small JSON Schema plus a
    provider-contract test suite would catch a provider-side change before it
    reaches production.

@@ -69,6 +69,7 @@ async def issue_token_pair(
         RefreshToken(
             user_id=user.id,
             jti=claims["jti"],
+            family_id=claims["jti"],
             expires_at=datetime.fromtimestamp(claims["exp"], tz=UTC),
             user_agent=(user_agent or "")[:300] or None,
         )
@@ -80,6 +81,27 @@ async def issue_token_pair(
         refresh_token,
         settings.access_token_expire_minutes * 60,
     )
+
+
+async def _revoke_token_family(session: AsyncSession, family_id: str) -> int:
+    """Revoke every still-live token in a rotation chain.
+
+    Commits before returning. The caller raises an AuthenticationError to reject
+    the request, and the request-scoped session rolls back on any exception, so
+    a deferred commit would silently discard the revocation and leave the
+    attacker holding a working token. The security action must not depend on the
+    request succeeding.
+    """
+    result = await session.execute(
+        select(RefreshToken)
+        .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
+        .with_for_update(of=RefreshToken)
+    )
+    tokens = list(result.scalars())
+    for token in tokens:
+        token.revoked_at = utcnow()
+    await session.commit()
+    return len(tokens)
 
 
 async def rotate_refresh_token(
@@ -97,6 +119,18 @@ async def rotate_refresh_token(
     if stored is None:
         raise AuthenticationError("Refresh token is not recognised.", code="unknown_refresh_token")
     if stored.revoked_at is not None:
+        # A rotated-past token coming back means either a replayed client or a
+        # stolen token racing the legitimate user; both mean the chain is no
+        # longer trustworthy, so burn the whole family. A token revoked by an
+        # explicit logout has no successor and is left alone, because logging
+        # out and retrying is not a compromise.
+        if stored.replaced_by_jti is not None:
+            await _revoke_token_family(session, stored.family_id)
+            raise AuthenticationError(
+                "This token was already rotated. All sessions in its chain have been revoked; "
+                "sign in again.",
+                code="refresh_token_reuse_detected",
+            )
         raise AuthenticationError(
             "Refresh token has already been used or revoked.", code="refresh_token_revoked"
         )
@@ -118,6 +152,7 @@ async def rotate_refresh_token(
         RefreshToken(
             user_id=user.id,
             jti=new_claims["jti"],
+            family_id=stored.family_id,
             expires_at=datetime.fromtimestamp(new_claims["exp"], tz=UTC),
             user_agent=(user_agent or "")[:300] or None,
         )
