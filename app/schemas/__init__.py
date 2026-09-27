@@ -1,0 +1,68 @@
+from app.schemas.auth import (
+    AuthResponse,
+    RefreshRequest,
+    TokenPair,
+    UserCreate,
+    UserLogin,
+    UserRead,
+)
+from app.schemas.booking import (
+    BookingCreate,
+    BookingDetail,
+    BookingRead,
+    BookingStatusChange,
+    CentreSummary,
+    TestSummary,
+)
+from app.schemas.catalogue import (
+    CentreCreate,
+    CentreRead,
+    CentreTestListUpdate,
+    CentreTestRead,
+    CentreTestUpsert,
+    CentreUpdate,
+    TestCreate,
+    TestRead,
+    TestUpdate,
+)
+from app.schemas.common import ErrorDetail, ErrorResponse, MessageResponse, Page
+from app.schemas.payment import (
+    PaymentCreate,
+    PaymentRead,
+    PaymentResponse,
+    WebhookAck,
+    WebhookEventIn,
+)
+
+__all__ = [
+    "AuthResponse",
+    "BookingCreate",
+    "BookingDetail",
+    "BookingRead",
+    "BookingStatusChange",
+    "CentreCreate",
+    "CentreRead",
+    "CentreSummary",
+    "CentreTestListUpdate",
+    "CentreTestRead",
+    "CentreTestUpsert",
+    "CentreUpdate",
+    "ErrorDetail",
+    "ErrorResponse",
+    "MessageResponse",
+    "Page",
+    "PaymentCreate",
+    "PaymentRead",
+    "PaymentResponse",
+    "RefreshRequest",
+    "TestCreate",
+    "TestRead",
+    "TestSummary",
+    "TestUpdate",
+    "TokenPair",
+    "UserCreate",
+    "UserLogin",
+    "UserRead",
+    "WebhookAck",
+    "WebhookEventIn",
+]

@@ -1,0 +1,95 @@
+name: eve-diagnostics
+
+x-app-env: &app-env
+  APP_NAME: "EVE Diagnostics Booking API"
+  ENVIRONMENT: development
+  DEBUG: "true"
+  DATABASE_URL: "postgresql+asyncpg://eve:eve@db:5432/eve_diagnostics"
+  JWT_SECRET_KEY: "local-compose-secret-key-change-me-before-deploying-anywhere"
+  JWT_ALGORITHM: HS256
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+  REFRESH_TOKEN_EXPIRE_DAYS: "7"
+  WEBHOOK_SIGNING_SECRET: "local-compose-webhook-secret"
+  WEBHOOK_REQUIRE_SIGNATURE: "false"
+  REDIS_URL: "redis://redis:6379/0"
+  CACHE_TTL_SECONDS: "60"
+  RATE_LIMIT_REQUESTS: "300"
+  RATE_LIMIT_WINDOW_SECONDS: "60"
+  LOG_LEVEL: INFO
+  LOG_JSON: "true"
+  SEED_ADMIN_EMAIL: "admin@eve.health"
+  SEED_ADMIN_PASSWORD: "Admin@12345"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: eve
+      POSTGRES_PASSWORD: eve
+      POSTGRES_DB: eve_diagnostics
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eve -d eve_diagnostics"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    build: .
+    command: ["python", "-m", "app.db.seed"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build: .
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "payments,default"]
+    environment: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
