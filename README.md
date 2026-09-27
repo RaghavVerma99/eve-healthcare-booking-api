@@ -54,6 +54,80 @@ make migrate && make seed && make run
 Admin accounts can create and edit centres, tests, and per-centre offerings.
 Regular users can browse the catalogue, book tests, and pay for bookings.
 
+## Architecture
+
+```
+app/
+  main.py            app factory, lifespan, OpenAPI
+  api/
+    deps.py          auth/ownership dependencies, pagination
+    middleware.py    request context, structured logging, rate limiting
+    router.py        route table
+    routers/         auth, catalogue, bookings, payments, system
+  core/              settings, errors, exception handlers, security, logging
+  db/                engine/session, base mixins, seed script
+  models/            SQLAlchemy models and state machines
+  schemas/           Pydantic request/response models
+  services/          all business logic and transaction boundaries
+  worker.py          Celery app
+alembic/versions/    schema migrations
+tests/               134 tests
+```
+
+Requests flow **router → service → model**. Routers do no business logic; they
+parse, authorise, call one service function, and commit. Services own the
+transaction boundaries and are the only place that mutates payment or booking
+state. That split is what makes the state machines testable without HTTP, and
+it is why `POST /payments/` and the webhook route can share one code path.
+
+### The decision that shaped the persistence layer
+
+`Booking` eager-loads `user`, `test`, and `centre` (`lazy="joined"`), because
+almost every booking response needs them and avoiding a second round trip is
+worth the join. That has a consequence that is easy to miss: **any
+`SELECT ... FOR UPDATE` on a booking now contains outer joins, and PostgreSQL
+rejects `FOR UPDATE` on the nullable side of an outer join.**
+
+So `SELECT bookings.* FOR UPDATE` fails on PostgreSQL with
+`cannot be applied to the nullable side of an outer join`, while SQLite ignores
+`FOR UPDATE` entirely and passes. A SQLite-only test run cannot catch this.
+
+The fix is `with_for_update(of=Booking)`, which scopes the lock to the booking
+row and leaves the joined rows alone. It is applied wherever a payment or
+refresh token is locked:
+
+- `app/services/payment_service.py` — serialises concurrent callbacks for one
+  booking, so a double capture is impossible
+- `app/services/auth_service.py` — serialises token rotation for one user
+
+`of=` is also what keeps the lock narrow. Without it PostgreSQL would lock the
+shared centre and user rows too, so two unrelated bookings at the same centre
+would queue behind each other. The same tests run green on SQLite and fail on
+PostgreSQL if this is removed, which is why the suite is verified on both.
+
+### Idempotency keys
+
+`POST /bookings/` and `POST /payments/` accept an optional `idempotency_key`
+(1–64 characters, whitespace trimmed). Presenting a key that has already been
+used **by the same user** returns the original resource instead of creating a
+duplicate, so a client that retries after a timeout cannot double-book or
+double-charge.
+
+Presenting a key that belongs to a **different user** is rejected with `403`
+`idempotency_key_conflict`, which stops one user from reading or overwriting
+another's resource by guessing keys. On payments an admin is exempt from that
+check, consistent with admin access to other users' bookings.
+
+Be aware that the key is matched on the key alone, not on a fingerprint of the
+request body. Reusing a key with a *different* body therefore returns the
+original booking rather than a conflict. Comparing a request fingerprint and
+rejecting the mismatch is the stricter behaviour and is listed under *What I
+would improve with more time*.
+
+This is separate from webhook idempotency, which is enforced by the
+`webhook_events` claim rather than by a client-supplied key, and needs no
+cooperation from the caller.
+
 ## Endpoints
 
 | Method   | Path                                        | Purpose                                       |
@@ -62,7 +136,7 @@ Regular users can browse the catalogue, book tests, and pay for bookings.
 | `POST`   | `/auth/signup`                              | Register and receive a token pair             |
 | `POST`   | `/auth/login`                               | JSON login                                    |
 | `POST`   | `/auth/token`                               | OAuth2 password flow (form encoded)           |
-| `POST`   | `/auth/refresh`                             | Rotate a refresh token (revokes the family on reuse) |
+| `POST`   | `/auth/refresh`                             | Rotate a refresh token                       |
 | `POST`   | `/auth/logout`                              | Revoke a refresh token                        |
 | `GET`    | `/auth/me`                                  | Current user                                  |
 | `GET`    | `/auth/config`                              | Non-sensitive runtime settings                |
@@ -121,6 +195,43 @@ jq '{payment: .payment.status, booking: .booking_status, event: .webhook.event_i
 curl -s -X POST $BASE/payments/webhook/ -H 'Content-Type: application/json' \
   -d "$(jq -c .webhook payment.json)" | jq '{event_id, duplicate, booking_status}'
 # { "event_id": "evt_...", "duplicate": true, "booking_status": "CONFIRMED" }
+```
+
+### Failure and retry
+
+A declined payment leaves the booking `FAILED` and payable again, so a user
+retries the same booking rather than rebooking. Every attempt is kept.
+
+```bash
+# Book again, then fail the payment
+BOOKING_ID=$(curl -s -X POST $BASE/bookings/ -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"test_id\":\"$TEST\",\"centre_id\":\"$CENTRE\",\"appointment_at\":\"2026-10-02T09:30:00+05:30\"}" \
+  | jq -r .id)
+
+curl -s -X POST $BASE/payments/ -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"booking_id\":\"$BOOKING_ID\",\"simulate\":\"insufficient_funds\"}" \
+  | jq '{payment: .payment.status, failure: .payment.failure_code, booking: .booking_status}'
+# { "payment": "FAILED", "failure": "insufficient_funds", "booking": "FAILED" }
+
+# Retry the same booking; it transitions FAILED -> PENDING -> SUCCESS
+curl -s -X POST $BASE/payments/ -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"booking_id\":\"$BOOKING_ID\",\"simulate\":\"success\"}" \
+  | jq '{payment: .payment.status, booking: .booking_status}'
+# { "payment": "SUCCESS", "booking": "CONFIRMED" }
+
+# Both attempts are visible, newest first
+curl -s "$BASE/bookings/$BOOKING_ID/payments" -H "Authorization: Bearer $TOKEN" \
+  | jq '[.[] | {status, failure_code, created_at}]'
+# [ { "status": "SUCCESS", "failure_code": null, "created_at": "..." },
+#   { "status": "FAILED", "failure_code": "insufficient_funds", ... } ]
+
+# A confirmed booking cannot be cancelled by its owner
+curl -s -X POST $BASE/bookings/$BOOKING_ID/cancel -H "Authorization: Bearer $TOKEN" \
+  | jq .error
+# { "code": "booking_not_cancellable", ... }
 ```
 
 ## Authentication and session security
@@ -250,7 +361,8 @@ Verified behaviour:
 
 - replaying one event three times yields one mutation and two `duplicate: true`
   responses
-- ten concurrent deliveries of one event produce exactly one applied update
+- five concurrent deliveries of one event, each with its own session, produce
+  exactly one applied update
 - a *new* event id for an already-settled payment is stored with
   `result: payment_already_applied` and changes nothing
 - an invalid HMAC signature is rejected with `401` before any write
@@ -271,10 +383,34 @@ retry-after-failure flow and its history visible via
 
 ## Data model
 
-`users`, `refresh_tokens`, `diagnostic_centres`, `diagnostic_tests`,
-`centre_tests` (per-centre price and availability), `bookings`, `payments`,
-`webhook_events`. UUID primary keys, timezone-aware UTC timestamps, and check
-constraints on money, coordinates, durations, and status values.
+Eight tables, UUID primary keys, timezone-aware UTC timestamps throughout.
+
+```
+users ──< bookings ──< payments ──< webhook_events
+  │          │                        (via payment_id)
+  └──< refresh_tokens
+centres ──< centre_tests >── tests        (per-centre price + availability)
+```
+
+| Table | Notable columns | Notes |
+| --- | --- | --- |
+| `users` | `email` unique, `hashed_password`, `is_admin`, `is_active` | email normalised to lowercase |
+| `refresh_tokens` | `jti` unique, `family_id`, `revoked_at`, `replaced_by_jti` | token itself is never stored |
+| `diagnostic_centres` | `latitude`/`longitude`, `city`, `is_active` | coordinates and status check-constrained |
+| `diagnostic_tests` | `base_price`, `duration_minutes` | `base_price` and duration check-constrained |
+| `centre_tests` | `price`, `is_available` | composite PK `(centre_id, test_id)`; per-centre override of `base_price` |
+| `bookings` | `reference` unique, `amount`, `status`, `appointment_at`, `idempotency_key` | `amount` snapshotted from `centre_tests.price` |
+| `payments` | `booking_id`, `amount`, `currency`, `status`, `provider_payment_id`, `failure_code` | `NUMERIC(10,2)`; `Decimal` end to end |
+| `webhook_events` | `event_id` PK, `event_type`, `payload`, `result` | claim target for idempotency |
+
+Indexes exist for the access patterns that matter: a user's bookings by recency
+(`ix_bookings_user_created`), a user's non-terminal bookings
+(`ix_bookings_user_status`), a centre's schedule
+(`ix_bookings_centre_appointment`), catalogue availability
+(`ix_centre_tests_test_available`), and active tokens per user
+(`ix_refresh_tokens_user_active`). Check constraints cover money, coordinates,
+durations, and status values, so bad data is rejected by the database and not
+only by Pydantic.
 
 Migrations live in `alembic/versions/`, and `alembic check` reports no drift on
 either database. `alembic/env.py` skips indexes declared for another dialect, so
@@ -426,9 +562,9 @@ Ordered by value, not by how interesting they are.
    webhook" cannot share a transaction, so a transactional outbox plus a
    delivery worker is the correct shape. This is the highest-value change here
    by a wide margin, and also the largest: a new table, a publisher, and a
-   restructuring of the payment transaction. I would not attempt it as a
-   timed "small change" exercise. A good live change in this codebase is
-   refresh-token reuse detection, which is what I implemented.
+   restructuring of the payment transaction, so it is a poor choice for a
+   timed "small change" exercise. Refresh-token reuse detection is a
+   better-sized example of the same kind of reasoning.
 2. **Outsourced auth.** Password hashing and JWT rotation are hand-rolled here
    deliberately, to show the mechanics. In production this should be a proven
    library or an identity provider, with key rotation and JWKS.
@@ -446,13 +582,18 @@ Ordered by value, not by how interesting they are.
 8. **Signing key rotation.** Tokens are signed with a single symmetric
    `JWT_SECRET_KEY`, so there is no `kid` and no way to roll a key without
    invalidating every session. Asymmetric signing with a published JWKS, and a
-   `kid` header so old keys can be retired gradually, is the fix. Note this
-   replaces the "hash the token at rest" idea I had listed previously: since
-   the raw token is never stored, that would have protected nothing. Token
-   *families* now provide the session abstraction that item was reaching for.
+   `kid` header so old keys can be retired gradually, is the fix. Note that
+   hashing the token at rest is deliberately *not* on this list: the raw token
+   is never stored, so there is nothing to hash. Token *families* already
+   provide the session abstraction.
 9. **Contract tests for the webhook schema.** A small JSON Schema plus a
    provider-contract test suite would catch a provider-side change before it
    reaches production.
+10. **Request fingerprinting for idempotency keys.** Keys are matched on the key
+    alone, so a reused key with a different body returns the original resource
+    instead of `409`. Storing a hash of the canonical request and rejecting a
+    mismatch would make reuse explicit rather than silently returning the old
+    resource.
 
 ## Production notes
 
