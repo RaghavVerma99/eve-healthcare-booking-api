@@ -40,6 +40,7 @@ app = FastAPI(
     version=settings.app_version,
     description=DESCRIPTION,
     lifespan=lifespan,
+    debug=settings.debug,
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",

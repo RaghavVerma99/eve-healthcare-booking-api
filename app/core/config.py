@@ -1,8 +1,8 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     debug: bool = False
 
     database_url: str = "postgresql+asyncpg://eve:eve@localhost:5432/eve_diagnostics"
-    test_database_url: str = "sqlite+aiosqlite:///./test.db"
     db_echo: bool = False
     db_pool_size: int = 10
     db_max_overflow: int = 20
@@ -44,13 +43,19 @@ class Settings(BaseSettings):
     seed_admin_email: str = "admin@eve.health"
     seed_admin_password: str = "Admin@12345"
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # NoDecode is required: without it pydantic-settings JSON-decodes the raw
+    # env value before validators run, so a plain CORS_ORIGINS="*" raises
+    # SettingsError instead of reaching _split_origins.
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
         if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
+            text = value.strip()
+            if text in ("", "[]"):
+                return []
+            return [item.strip() for item in text.split(",") if item.strip()]
         return value
 
     @property

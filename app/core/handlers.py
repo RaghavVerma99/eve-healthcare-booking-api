@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.config import settings
 from app.core.exceptions import AppError
 from app.core.logging_config import configure_logging, get_logger
 
@@ -114,10 +115,13 @@ def register_middleware(app: FastAPI) -> None:
     from app.api.middleware import RateLimitMiddleware
 
     app.add_middleware(RateLimitMiddleware)
+    # The CORS spec forbids credentials alongside a wildcard origin, so
+    # credentials are enabled only for an explicit allowlist.
+    allow_credentials = "*" not in settings.cors_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if app.debug else [],
-        allow_credentials=False,
+        allow_origins=settings.cors_origins,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

@@ -7,7 +7,7 @@ gateway with an idempotent webhook receiver.
 - **Stack:** FastAPI, async SQLAlchemy 2, Alembic, PostgreSQL (`asyncpg`),
   Redis cache, Celery worker, JWT auth, Pydantic v2
 - **Interactive docs:** `/docs` (Swagger), `/redoc`
-- **Tests:** 126 passing, run against SQLite by default or PostgreSQL with
+- **Tests:** 134 passing, run against SQLite by default or PostgreSQL with
   `TEST_DATABASE_URL`
 - **Requires:** Python 3.11+ (developed on 3.14), PostgreSQL 14+ or SQLite 3.35+
 
@@ -314,7 +314,7 @@ back, which additionally revokes the whole token family. See
 ## Testing
 
 ```bash
-make test                                        # SQLite in-memory, 126 tests
+make test                                        # SQLite in-memory, 134 tests
 make lint                                        # ruff over app, tests, alembic
 
 # PostgreSQL: the suite creates and drops its own schema, so point it at an
@@ -325,7 +325,7 @@ make test-postgres                               # or override the target:
 make test-postgres TEST_PG_URL=postgresql+asyncpg://eve@127.0.0.1:5432/eve_diagnostics_test
 ```
 
-All 126 tests pass on **both** SQLite and PostgreSQL 18. Running them against
+All 134 tests pass on **both** SQLite and PostgreSQL 18. Running them against
 PostgreSQL matters: it exercises `SELECT ... FOR UPDATE`, the
 `INSERT ... ON CONFLICT DO NOTHING` event claim, and the partial unique index,
 none of which SQLite actually enforces. SQLite silently ignores `FOR UPDATE` and
@@ -373,6 +373,7 @@ The values that matter most:
 | `WEBHOOK_REQUIRE_SIGNATURE` | `false`                                       | Turn on to enforce `X-Signature`        |
 | `REDIS_URL`                 | `redis://localhost:6379/0`                    | Empty falls back to in-process cache    |
 | `RATE_LIMIT_REQUESTS`       | `100`                                         | `0` disables rate limiting              |
+| `CORS_ORIGINS`              | empty (deny all cross-origin)                 | Comma-separated allowlist, or `*`        |
 | `LOG_JSON`                  | `true`                                        | JSON logs for ingestion                 |
 | `SEED_ADMIN_EMAIL` / `_PASSWORD` | `admin@eve.health` / `Admin@12345`     | Only used by the seed script            |
 
@@ -457,6 +458,9 @@ Ordered by value, not by how interesting they are.
 
 - Replace `JWT_SECRET_KEY` and `WEBHOOK_SIGNING_SECRET`; set
   `ENVIRONMENT=production`, `DEBUG=false`, and an explicit `CORS_ORIGINS`.
+  Cross-origin requests are denied unless `CORS_ORIGINS` names them, and
+  `allow_credentials` is only enabled for an explicit allowlist because the
+  CORS spec forbids credentials alongside a `*` origin.
 - The PostgreSQL partial unique index is the real guard against double capture;
   keep it when deploying to Postgres.
 - Rate limiting and caching are per-process. For a multi-worker deployment,

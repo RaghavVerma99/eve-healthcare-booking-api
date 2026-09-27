@@ -1,3 +1,4 @@
+import pytest
 from httpx import AsyncClient
 from tests.helpers import create_booking, pay_booking
 
@@ -33,6 +34,60 @@ async def test_responses_carry_request_id_header(client: AsyncClient) -> None:
     response = await client.get("/health", headers={"X-Request-ID": "trace-123"})
     assert response.headers["X-Request-ID"] == "trace-123"
     assert "X-Response-Time-ms" in response.headers
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("*", ["*"]),
+        ("http://a.test,http://b.test", ["http://a.test", "http://b.test"]),
+        (" http://a.test , , http://b.test ", ["http://a.test", "http://b.test"]),
+        ("[]", []),
+        ("", []),
+    ],
+)
+def test_cors_origins_accepts_a_comma_separated_env_value(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]
+) -> None:
+    # pydantic-settings JSON-decodes list fields unless NoDecode is present, so
+    # a bare "*" used to raise SettingsError instead of reaching the validator.
+    from app.core.config import Settings
+
+    monkeypatch.setenv("CORS_ORIGINS", raw)
+    assert Settings(_env_file=None).cors_origins == expected
+
+
+def test_cors_origins_defaults_to_denying_every_origin() -> None:
+    from app.core.config import Settings
+
+    assert Settings(_env_file=None).cors_origins == []
+
+
+@pytest.mark.parametrize(
+    "origins,expected_credentials",
+    [
+        (["*"], False),
+        (["https://app.eve.health"], True),
+    ],
+)
+def test_cors_middleware_uses_configured_origins(
+    monkeypatch: pytest.MonkeyPatch, origins: list[str], expected_credentials: bool
+) -> None:
+    from app.core.config import settings
+    from app.core.handlers import register_middleware
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+
+    monkeypatch.setattr(settings, "cors_origins", origins)
+    app = FastAPI()
+    register_middleware(app)
+
+    cors = [m for m in app.user_middleware if m.cls is CORSMiddleware]
+    assert len(cors) == 1
+    assert cors[0].kwargs["allow_origins"] == origins
+    # The CORS spec forbids credentials alongside "*", so an allowlist is
+    # required before allow_credentials may be true.
+    assert cors[0].kwargs["allow_credentials"] is expected_credentials
 
 
 def test_sliding_window_rate_limiter_blocks_after_limit() -> None:
