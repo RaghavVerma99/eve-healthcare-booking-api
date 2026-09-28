@@ -10,7 +10,6 @@ from app.schemas.booking import (
     BookingCreate,
     BookingDetail,
     BookingRead,
-    BookingStatusChange,
     CentreSummary,
     TestSummary,
 )
@@ -39,7 +38,6 @@ __all__ = [
     "BookingCreate",
     "BookingDetail",
     "BookingRead",
-    "BookingStatusChange",
     "CentreCreate",
     "CentreRead",
     "CentreSummary",

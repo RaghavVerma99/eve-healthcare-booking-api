@@ -68,8 +68,3 @@ class BookingRead(ORMModel):
 
 class BookingDetail(BookingRead):
     payments: list[PaymentRead] = Field(default_factory=list)
-
-
-class BookingStatusChange(BaseModel):
-    status: BookingStatus
-    reason: str | None = Field(default=None, max_length=255)

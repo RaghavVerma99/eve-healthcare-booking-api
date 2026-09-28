@@ -7,7 +7,7 @@ gateway with an idempotent webhook receiver.
 - **Stack:** FastAPI, async SQLAlchemy 2, Alembic, PostgreSQL (`asyncpg`),
   Redis cache, Celery worker, JWT auth, Pydantic v2
 - **Interactive docs:** `/docs` (Swagger), `/redoc`
-- **Tests:** 134 passing, run against SQLite by default or PostgreSQL with
+- **Tests:** 150 passing, run against SQLite by default or PostgreSQL with
   `TEST_DATABASE_URL`
 - **Requires:** Python 3.11+ (developed on 3.14), PostgreSQL 14+ or SQLite 3.35+
 
@@ -64,14 +64,14 @@ app/
     middleware.py    request context, structured logging, rate limiting
     router.py        route table
     routers/         auth, catalogue, bookings, payments, system
-  core/              settings, errors, exception handlers, security, logging
+  core/              settings, exception types, exception handlers, security, logging
   db/                engine/session, base mixins, seed script
   models/            SQLAlchemy models and state machines
   schemas/           Pydantic request/response models
   services/          all business logic and transaction boundaries
   worker.py          Celery app
 alembic/versions/    schema migrations
-tests/               134 tests
+tests/               150 tests
 ```
 
 Requests flow **router → service → model**. Routers do no business logic; they
@@ -155,12 +155,12 @@ cooperation from the caller.
 | `GET`    | `/bookings/`                                | Current user's bookings                       |
 | `GET`    | `/bookings/{booking_id}`                    | Booking detail                                |
 | `POST`   | `/bookings/{booking_id}/cancel`             | Cancel a booking                              |
-| `DELETE` | `/bookings/{booking_id}`                    | Cancel alias                                  |
 | `GET`    | `/bookings/{booking_id}/payments`           | Payment attempts for a booking                |
 | `POST`   | `/payments/`                                | Simulated payment for a booking               |
 | `POST`   | `/payments/webhook/`                        | Idempotent provider callback                  |
 | `GET`    | `/payments/{payment_id}`                    | Payment detail (owner)                        |
 | `GET`    | `/payments/webhook/{event_id}`              | Inspect a stored event (admin)                |
+| `POST`   | `/payments/webhook/{event_id}/replay`      | Re-queue a stored event (admin)              |
 
 ### Walkthrough
 
@@ -191,11 +191,26 @@ curl -s -X POST $BASE/payments/ -H "Authorization: Bearer $TOKEN" \
 jq '{payment: .payment.status, booking: .booking_status, event: .webhook.event_id}' payment.json
 # { "payment": "SUCCESS", "booking": "CONFIRMED", "event": "evt_..." }
 
-# 5. A provider retry of the same event is safe: replay it verbatim
+# 5. A provider retry of the same event is safe: replay it verbatim.
+#    Signatures are required by default, so sign the exact bytes you send.
+BODY=$(jq -c .webhook payment.json)
+SIG=$(printf '%s' "$BODY" | python3 -c \
+  'import hashlib,hmac,os,sys; print(hmac.new(os.environ["WEBHOOK_SIGNING_SECRET"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
+
 curl -s -X POST $BASE/payments/webhook/ -H 'Content-Type: application/json' \
-  -d "$(jq -c .webhook payment.json)" | jq '{event_id, duplicate, booking_status}'
+  -H "X-Signature: sha256=$SIG" -d "$BODY" | jq '{event_id, duplicate, booking_status}'
 # { "event_id": "evt_...", "duplicate": true, "booking_status": "CONFIRMED" }
 ```
+
+Export the secret first, since the signature has to be computed with the same
+key the receiver holds:
+
+```bash
+export WEBHOOK_SIGNING_SECRET=mockpay-webhook-secret   # the .env.example default
+```
+
+Set `WEBHOOK_REQUIRE_SIGNATURE=false` to drop the header while experimenting;
+the receiver is unauthenticated, so the default is on.
 
 ### Failure and retry
 
@@ -330,6 +345,16 @@ Design decisions worth calling out:
   payment the money is captured, so the refund path owns cancellation.
 - **The booking amount is snapshotted** from `centre_tests.price` at booking
   time, so later catalogue price changes never alter an existing booking.
+- **A centre slot can hold one live booking, enforced by the database.**
+  `create_booking` reads for a conflicting slot first, so the common case gets a
+  clear `409 appointment_slot_taken` instead of a constraint error. That read
+  cannot see a concurrent transaction that has not committed, so it is advisory
+  only: two simultaneous requests for the same slot can both pass it. The
+  partial unique index `uq_bookings_active_slot`
+  (`WHERE status IN ('PENDING','CONFIRMED')`) is the authoritative guard, and
+  the losing request surfaces as the same `409` from an `IntegrityError` caught
+  in a savepoint. Because the predicate covers only live statuses, cancelling or
+  failing a booking releases its slot for rebooking.
 - **Money is `NUMERIC(10,2)`** and handled as `Decimal` end to end. A partial
   unique index `uq_payments_single_success_per_booking`
   (`WHERE status = 'SUCCESS'`) makes a second successful payment for one
@@ -338,6 +363,10 @@ Design decisions worth calling out:
 - **Failed payments are not terminal.** A new `POST /payments/` retries the
   booking, so `FAILED` is a valid payable state and the attempt history is
   preserved.
+- **Cancelling is not deleting.** `DELETE /bookings/{id}` returns `405`; the
+  only way to end a booking early is `POST /bookings/{id}/cancel`. A `DELETE`
+  that quietly cancelled would report `200` for a request that destroyed
+  nothing, which is worse than an honest `405`.
 
 ## Webhook idempotency
 
@@ -354,8 +383,41 @@ identically.
 3. Resolve the target payment by `payment_id`, then
    `provider + provider_payment_id`, then `booking_reference`, then
    `booking_id` (newest attempt first).
-4. Apply the transition inside the same transaction as the event write, so a
+4. Check the amount and currency the provider settled against the ones we
+   charged, when it sends them.
+5. Apply the transition inside the same transaction as the event write, so a
    crash cannot leave the event marked processed without the payment moving.
+
+### What a repeat delivery is allowed to do
+
+A duplicate must not mutate state, but its acknowledgement still has to be
+honest. The ack names the payment **the caller just asked about**, resolved from
+the request body, not the one the first delivery happened to reference. If a
+provider recycled an `event_id` across two payments, the second ack describes the
+second payment — including the fact that it is still `FAILED` — and the collision
+is logged as `webhook_event_id_reused` at `ERROR`. Reporting the first delivery's
+booking would have told the provider its new payment was settled when it was not.
+
+`WebhookAck` therefore carries `payment_id` alongside `booking_status`, and a
+replay whose body cannot be resolved at all still acks `200` from the stored row
+rather than turning into a `404`.
+
+### Signature verification
+
+`webhook_events.signature_valid` is tri-state, and the distinction matters:
+
+| Value  | Meaning                                              |
+| ------ | ---------------------------------------------------- |
+| `true` | a signature verified (or the event came from the in-process gateway) |
+| `false`| a signature was presented and **rejected**; parked in `FAILED`, never applied |
+| `null` | signature checking was not enabled for this delivery |
+
+Collapsing "not checked" into `false` would make every unsigned delivery look
+like an attack in the admin inspector, and would permanently block the replay
+task from re-processing it.
+
+`X-Signature` accepts a bare hex digest or the conventional `sha256=<hex>`
+prefix, in any case, and is compared with `hmac.compare_digest`.
 
 Verified behaviour:
 
@@ -364,11 +426,11 @@ Verified behaviour:
 - five concurrent deliveries of one event, each with its own session, produce
   exactly one applied update
 - a *new* event id for an already-settled payment is stored with
-  `result: payment_already_applied` and changes nothing
+  `result: payment_already_applied` and changes nothing, including the stored
+  `provider_payment_id`
 - an invalid HMAC signature is rejected with `401` before any write
-
-Set `WEBHOOK_REQUIRE_SIGNATURE=true` and sign the raw body with
-`WEBHOOK_SIGNING_SECRET` to require `X-Signature: sha256=<hex hmac>`.
+- a settlement quoting the wrong amount or currency is `422` and the payment
+  keeps its previous status
 
 ## Payments
 
@@ -380,6 +442,13 @@ the normal path is exercised in tests and in local development.
 `insufficient_funds`, `gateway_error`. Every attempt is stored, which makes the
 retry-after-failure flow and its history visible via
 `GET /bookings/{id}/payments`.
+
+The provider is not trusted to be right about the invoice. `apply_payment_outcome`
+already short-circuits a settled payment, then checks the amount and currency the
+event quotes against what was charged — a mismatch is `422 amount_mismatch` or
+`422 currency_mismatch` and the payment keeps its previous status. Recording the
+provider's `provider_payment_id` happens only after those checks, so a second
+event cannot overwrite the reference the first one stored.
 
 ## Data model
 
@@ -401,16 +470,27 @@ centres ──< centre_tests >── tests        (per-centre price + availabili
 | `centre_tests` | `price`, `is_available` | composite PK `(centre_id, test_id)`; per-centre override of `base_price` |
 | `bookings` | `reference` unique, `amount`, `status`, `appointment_at`, `idempotency_key` | `amount` snapshotted from `centre_tests.price` |
 | `payments` | `booking_id`, `amount`, `currency`, `status`, `provider_payment_id`, `failure_code` | `NUMERIC(10,2)`; `Decimal` end to end |
-| `webhook_events` | `event_id` PK, `event_type`, `payload`, `result` | claim target for idempotency |
+| `webhook_events` | `event_id` PK, `event_type`, `payload`, `result`, `signature_valid` | claim target for idempotency; `signature_valid` is nullable so "not checked" is distinct from "rejected" |
 
 Indexes exist for the access patterns that matter: a user's bookings by recency
 (`ix_bookings_user_created`), a user's non-terminal bookings
 (`ix_bookings_user_status`), a centre's schedule
 (`ix_bookings_centre_appointment`), catalogue availability
 (`ix_centre_tests_test_available`), and active tokens per user
-(`ix_refresh_tokens_user_active`). Check constraints cover money, coordinates,
-durations, and status values, so bad data is rejected by the database and not
-only by Pydantic.
+(`ix_refresh_tokens_user_active`). Two partial unique indexes carry invariants
+that application checks cannot enforce on their own:
+
+| Index | Table | Predicate | Enforces |
+| --- | --- | --- | --- |
+| `uq_bookings_active_slot` | `bookings` | `status IN ('PENDING','CONFIRMED')` | one live booking per centre per slot |
+| `uq_payments_single_success_per_booking` | `payments` | `status = 'SUCCESS'` | at most one captured payment per booking |
+
+The first exists on both PostgreSQL and SQLite, so the double-booking guarantee
+is testable in the default suite; the second is PostgreSQL-only (`ddl_if`)
+because SQLite's partial-index support is not relied on for a payment invariant,
+and the service enforces it in application code as well. Check constraints cover
+money, coordinates, durations, and status values, so bad data is rejected by the
+database and not only by Pydantic.
 
 Migrations live in `alembic/versions/`, and `alembic check` reports no drift on
 either database. `alembic/env.py` skips indexes declared for another dialect, so
@@ -450,7 +530,7 @@ back, which additionally revokes the whole token family. See
 ## Testing
 
 ```bash
-make test                                        # SQLite in-memory, 134 tests
+make test                                        # SQLite in-memory, 150 tests
 make lint                                        # ruff over app, tests, alembic
 
 # PostgreSQL: the suite creates and drops its own schema, so point it at an
@@ -461,20 +541,26 @@ make test-postgres                               # or override the target:
 make test-postgres TEST_PG_URL=postgresql+asyncpg://eve@127.0.0.1:5432/eve_diagnostics_test
 ```
 
-All 134 tests pass on **both** SQLite and PostgreSQL 18. Running them against
+All 150 tests pass on **both** SQLite and PostgreSQL. Running them against
 PostgreSQL matters: it exercises `SELECT ... FOR UPDATE`, the
-`INSERT ... ON CONFLICT DO NOTHING` event claim, and the partial unique index,
-none of which SQLite actually enforces. SQLite silently ignores `FOR UPDATE` and
-has no partial indexes, so a SQLite-only pass would hide real concurrency bugs.
+`INSERT ... ON CONFLICT DO NOTHING` event claim, and
+`uq_payments_single_success_per_booking`, none of which SQLite enforces. SQLite
+silently ignores `FOR UPDATE` and cannot host that payment-specific index, so a
+SQLite-only pass would hide real concurrency bugs. `uq_bookings_active_slot` is
+declared for both dialects precisely so the double-booking guarantee *is* covered
+by the default run.
 
 Coverage includes the full booking and payment state machines, concurrent
-webhook delivery, signature verification, ownership and admin authorization,
-token rotation and reuse detection, pagination, and cache invalidation.
+webhook delivery, signature verification, amount and currency reconciliation,
+slot contention, ownership and admin authorization, token rotation and reuse
+detection, pagination, and cache invalidation.
 
 Concurrency tests use a `concurrent_client` fixture that gives every request
 its own session, mirroring production. Sharing one session would both break on
 PostgreSQL and fake concurrency on SQLite, where all tasks share one
-connection.
+connection. The shared-session `client` fixture revives its session after a
+request that failed mid-write, which is what production gets for free from
+closing a session per request.
 
 Verified against a live PostgreSQL instance:
 
@@ -483,18 +569,35 @@ Verified against a live PostgreSQL instance:
 - inserting a second `SUCCESS` payment directly in SQL is rejected by
   `uq_payments_single_success_per_booking`
 
+The double-booking guard is verified on both dialects, since
+`uq_bookings_active_slot` is declared for each: with the advisory pre-check
+deliberately blinded, a second insert for a slot that already holds a live
+booking is still refused with `409 appointment_slot_taken`, and the centre keeps
+exactly one booking at that time.
+
 ## Background worker
 
-Optional Celery worker for work that should not block a request:
+The Celery worker and beat handle work that should not block a request:
 
 ```bash
 make worker        # celery -A app.worker.celery_app worker -Q payments,default
+make beat          # celery -A app.worker.celery_app beat
 ```
 
-Tasks: `bookings.expire_stale_pending` (age out unpaid bookings),
-`payments.replay_webhook` (reprocess a failed event), `webhooks.dispatch`.
+| Task | Trigger | Does |
+| --- | --- | --- |
+| `bookings.expire_stale_pending` | beat, every 15 min | cancels `PENDING` bookings whose appointment is more than 24 h past, freeing the slot |
+| `auth.purge_expired_refresh_tokens` | beat, every 6 h | deletes refresh tokens that expired more than a day ago |
+| `payments.replay_webhook` | `POST /payments/webhook/{event_id}/replay` (admin) | re-queues a stored event, for one parked in `FAILED` |
+
+`expire_stale_pending` selects with `FOR UPDATE SKIP LOCKED`, so it never blocks
+on or races a payment that is confirming the same booking. Replay is safe to
+trigger repeatedly: the processor is idempotent, so replaying a settled event is
+a no-op. If the broker is unreachable the endpoint returns `503
+queue_unavailable` rather than pretending the work was queued.
+
 Redis backs both the cache and the broker. The API is fully functional without
-the worker running.
+the worker or beat running — only the recurring maintenance is deferred.
 
 ## Configuration
 
@@ -506,9 +609,10 @@ The values that matter most:
 | `DATABASE_URL`              | `postgresql+asyncpg://eve:eve@localhost/eve_diagnostics` | SQLite is also supported      |
 | `JWT_SECRET_KEY`            | placeholder                                   | **Must** be replaced in production     |
 | `WEBHOOK_SIGNING_SECRET`    | `mockpay-webhook-secret`                      | HMAC key for webhook signatures         |
-| `WEBHOOK_REQUIRE_SIGNATURE` | `false`                                       | Turn on to enforce `X-Signature`        |
+| `WEBHOOK_REQUIRE_SIGNATURE` | `true`                                        | Set `false` only for local experiments  |
 | `REDIS_URL`                 | `redis://localhost:6379/0`                    | Empty falls back to in-process cache    |
 | `RATE_LIMIT_REQUESTS`       | `100`                                         | `0` disables rate limiting              |
+| `RATE_LIMIT_TRUST_PROXY_HEADERS` | `false`                                   | Only behind a proxy that overwrites the header |
 | `CORS_ORIGINS`              | empty (deny all cross-origin)                 | Comma-separated allowlist, or `*`        |
 | `LOG_JSON`                  | `true`                                        | JSON logs for ingestion                 |
 | `SEED_ADMIN_EMAIL` / `_PASSWORD` | `admin@eve.health` / `Admin@12345`     | Only used by the seed script            |
@@ -518,9 +622,11 @@ The values that matter most:
 The assignment left several things open. These are the calls I made and why.
 
 1. **A booking must be paid within a window.** Bookings start `PENDING` and are
-   not auto-confirmed, because payment is what confirms them. A worker task
-   (`bookings.expire_stale_pending`) can age out abandoned ones; nothing in the
-   API schedules it, so unpaid bookings stay `PENDING` until something does.
+   not auto-confirmed, because payment is what confirms them.
+   `bookings.expire_stale_pending` ages out abandoned ones on a 15-minute beat
+   schedule, so an unpaid slot frees itself instead of blocking the calendar
+   forever. The API alone does not run it; without the worker, bookings stay
+   `PENDING` until it does.
 2. **`FAILED` is retryable, `CANCELLED` is terminal.** A declined payment should
    not force the user to rebook, so a failed booking can be paid again and the
    attempt history is kept. Cancellation ends the lifecycle.
@@ -533,8 +639,13 @@ The assignment left several things open. These are the calls I made and why.
 5. **Webhook `data` shape is not specified, so the receiver is flexible.** The
    target payment is resolved by `payment_id`, then
    `provider` + `provider_payment_id`, then `booking_reference`, then
-   `booking_id`. An unrecognisable event is stored as `IGNORED` rather than
-   rejected, so nothing is lost and a retry can still be processed.
+   `booking_id`. An event naming no payment we can resolve is a `404
+   payment_not_found` and nothing is written. I originally stored those as
+   `IGNORED`, but that status had no writer outside the branch that rejected
+   them, and `404` is the truthful answer: we were not asked about something we
+   hold. The event is not lost either, because a provider retry that carries a
+   resolvable payload will be stored under a new `event_id` and processed
+   normally.
 6. **Only the three required event types are accepted**
    (`payment.succeeded`, `payment.failed`, `payment.refunded`). Unknown event
    types are a `422` rather than being silently swallowed.
@@ -546,11 +657,17 @@ The assignment left several things open. These are the calls I made and why.
    and revocation possible. Only the `jti` is stored, never the token, and each
    rotation inherits a `family_id` so that reuse of a superseded token can burn
    exactly that login chain. See *Authentication and session security*.
-10. **SQLite is a development convenience, PostgreSQL is the target.** The
-    PostgreSQL-only partial index is the real double-capture guard, so PG is the
-    only database where the full guarantee is enforced by the database itself.
+10. **SQLite is a development convenience, PostgreSQL is the target.** On
+    PostgreSQL both guards are enforced by the database: the partial unique
+    index on live booking slots and the one on captured payments. SQLite hosts
+    the slot index too, so that guarantee is covered by the default test run;
+    it cannot host the payment index, so that one is application-enforced there.
 11. **Rate limiting and caching are per process.** Correct for a single replica,
-    documented as a limitation rather than silently assumed away.
+    documented as a limitation rather than silently assumed away. The window
+    key is the peer address, not a forwarded header, because a client can set
+    `X-Forwarded-For` itself; enable `RATE_LIMIT_TRUST_PROXY_HEADERS` only
+    behind a proxy that overwrites it.
+
 
 ## What I would improve with more time
 

@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import Depends, Query, Request
+from fastapi import Depends, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,12 +68,3 @@ class Pagination:
 
 
 PaginationDep = Annotated[Pagination, Depends(Pagination)]
-
-
-def client_key(request: Request, user: User | None = None) -> str:
-    if user is not None:
-        return f"user:{user.id}"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return f"ip:{forwarded.split(',')[0].strip()}"
-    return f"ip:{request.client.host if request.client else 'unknown'}"

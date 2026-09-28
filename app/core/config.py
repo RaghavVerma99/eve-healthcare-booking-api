@@ -29,13 +29,17 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 7
 
     webhook_signing_secret: str = "mockpay-webhook-secret"
-    webhook_require_signature: bool = False
+    webhook_require_signature: bool = True
 
     redis_url: str = "redis://localhost:6379/0"
     cache_ttl_seconds: int = 60
 
     rate_limit_requests: int = 100
     rate_limit_window_seconds: int = 60
+    # X-Forwarded-For is client-controlled, so trusting it by default would let
+    # anyone sidestep the limiter by rotating the header. Enable this only when
+    # a proxy you control is the sole ingress and overwrites the header.
+    rate_limit_trust_proxy_headers: bool = False
 
     log_level: str = "INFO"
     log_json: bool = True

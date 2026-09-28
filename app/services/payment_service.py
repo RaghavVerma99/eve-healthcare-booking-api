@@ -1,5 +1,7 @@
 import re
 import uuid
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -87,7 +89,28 @@ async def apply_payment_outcome(
     provider_payment_id: str | None = None,
     failure_code: str | None = None,
     failure_reason: str | None = None,
+    claimed_amount: Any = None,
+    claimed_currency: str | None = None,
 ) -> tuple[Booking, str]:
+    # Already-settled payments short-circuit first. Recording the provider
+    # reference before this check let a second, differently-identified event
+    # silently overwrite the reference the first one stored.
+    if payment.status == target_status:
+        booking = await _lock_booking(session, payment.booking_id)
+        return booking, "payment_already_applied"
+
+    _assert_amount_matches(payment, claimed_amount, claimed_currency)
+
+    if not can_payment_transition(payment.status, target_status):
+        raise InvalidStateTransitionError(
+            f"A payment in status {payment.status.value} cannot move to {target_status.value}.",
+            code="payment_state_conflict",
+            details={
+                "current_status": payment.status.value,
+                "requested_status": target_status.value,
+            },
+        )
+
     if provider_payment_id:
         duplicate = await session.scalar(
             select(Payment.id).where(
@@ -102,20 +125,6 @@ async def apply_payment_outcome(
                 code="duplicate_provider_payment_id",
             )
         payment.provider_payment_id = provider_payment_id
-
-    if payment.status == target_status:
-        booking = await _lock_booking(session, payment.booking_id)
-        return booking, "payment_already_applied"
-
-    if not can_payment_transition(payment.status, target_status):
-        raise InvalidStateTransitionError(
-            f"A payment in status {payment.status.value} cannot move to {target_status.value}.",
-            code="payment_state_conflict",
-            details={
-                "current_status": payment.status.value,
-                "requested_status": target_status.value,
-            },
-        )
 
     payment.status = target_status
     payment.failure_code = failure_code
@@ -145,6 +154,46 @@ async def apply_payment_outcome(
         booking.cancelled_at = utcnow()
     await session.flush()
     return booking, "applied"
+
+
+def _assert_amount_matches(
+    payment: Payment, claimed_amount: Any, claimed_currency: str | None
+) -> None:
+    """Reject a settlement for a different amount or currency than we charged.
+
+    A provider is the only party allowed to settle a payment, but it still has
+    to agree with the invoice. Trusting the amount on the event would let a
+    malformed or tampered delivery confirm an arbitrary figure, so the amount is
+    checked whenever the provider bothers to send one.
+    """
+    if claimed_amount is not None:
+        try:
+            amount = Decimal(str(claimed_amount))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise UnprocessableError(
+                "amount in the webhook payload is not a valid decimal.",
+                code="invalid_amount",
+            ) from exc
+        if amount != payment.amount:
+            raise UnprocessableError(
+                "The settled amount does not match the payment amount.",
+                code="amount_mismatch",
+                details={
+                    "payment_id": str(payment.id),
+                    "expected_amount": str(payment.amount),
+                    "claimed_amount": str(amount),
+                },
+            )
+    if claimed_currency and claimed_currency.upper() != payment.currency.upper():
+        raise UnprocessableError(
+            "The settled currency does not match the payment currency.",
+            code="currency_mismatch",
+            details={
+                "payment_id": str(payment.id),
+                "expected_currency": payment.currency,
+                "claimed_currency": claimed_currency,
+            },
+        )
 
 
 async def initiate_payment(

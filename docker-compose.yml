@@ -10,7 +10,7 @@ x-app-env: &app-env
   ACCESS_TOKEN_EXPIRE_MINUTES: "30"
   REFRESH_TOKEN_EXPIRE_DAYS: "7"
   WEBHOOK_SIGNING_SECRET: "local-compose-webhook-secret"
-  WEBHOOK_REQUIRE_SIGNATURE: "false"
+  WEBHOOK_REQUIRE_SIGNATURE: "true"
   REDIS_URL: "redis://redis:6379/0"
   CACHE_TTL_SECONDS: "60"
   RATE_LIMIT_REQUESTS: "300"
@@ -83,6 +83,19 @@ services:
   worker:
     build: .
     command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "payments,default"]
+    environment: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Drives the recurring maintenance tasks (aging out abandoned bookings and
+  # purging expired refresh tokens). The API does not depend on it.
+  beat:
+    build: .
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=info"]
     environment: *app-env
     depends_on:
       redis:

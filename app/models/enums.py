@@ -24,7 +24,6 @@ class WebhookEventType(StrEnum):
 class WebhookProcessingStatus(StrEnum):
     RECEIVED = "RECEIVED"
     PROCESSED = "PROCESSED"
-    IGNORED = "IGNORED"
     FAILED = "FAILED"
 
 

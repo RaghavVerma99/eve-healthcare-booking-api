@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError, UnprocessableError
+from app.core.exceptions import AppError, NotFoundError, UnprocessableError
 from app.core.logging_config import get_logger
 from app.db.types import utcnow
 from app.models.booking import Booking
@@ -35,13 +35,6 @@ class WebhookOutcome:
     booking_status: str | None = None
     payment_id: str | None = None
     result: str | None = None
-
-    @property
-    def acknowledged(self) -> bool:
-        return self.status in {
-            WebhookProcessingStatus.PROCESSED,
-            WebhookProcessingStatus.IGNORED,
-        }
 
 
 def _insert_factory(session: AsyncSession):
@@ -174,9 +167,57 @@ def _stored_outcome(
     )
 
 
-async def handle_webhook_event(
-    session: AsyncSession, payload: WebhookEventIn, *, signature_valid: bool | None = None
+async def _duplicate_outcome(
+    session: AsyncSession, event: WebhookEvent, payload: WebhookEventIn
 ) -> WebhookOutcome:
+    """Acknowledge a repeat delivery without touching stored state.
+
+    The ack has to describe the payment the caller just asked about, not the one
+    the first delivery happened to reference. A provider that recycles an
+    `event_id` across two payments would otherwise be told its second payment
+    was applied when it was not.
+    """
+    booking_status = await _current_booking_status(session, event.booking_id)
+    result = event.result or "already_received"
+
+    try:
+        payment = await _resolve_payment(session, payload.data)
+    except AppError:
+        # Unresolvable replay: the stored event is the only thing we can report.
+        return _stored_outcome(event, booking_status, duplicate=True)
+
+    if event.payment_id is not None and payment.id != event.payment_id:
+        logger.error(
+            "webhook_event_id_reused",
+            extra={
+                "event_id": payload.event_id,
+                "stored_payment_id": str(event.payment_id),
+                "replayed_payment_id": str(payment.id),
+            },
+        )
+        result = "event_id_reused"
+    return WebhookOutcome(
+        event_id=event.event_id,
+        duplicate=True,
+        status=event.status,
+        booking_status=await _current_booking_status(session, payment.booking_id),
+        payment_id=str(payment.id),
+        result=result,
+    )
+
+
+async def handle_webhook_event(
+    session: AsyncSession,
+    payload: WebhookEventIn,
+    *,
+    signature_valid: bool | None = None,
+) -> WebhookOutcome:
+    """Process one delivery. Safe to call repeatedly with the same event.
+
+    `signature_valid` is tri-state: True when a signature verified, False when
+    one was rejected (the event is parked in FAILED and not applied), and None
+    when signature checking was not enabled for this delivery.
+    """
     try:
         event_type = WebhookEventType(payload.event_type)
     except ValueError as exc:
@@ -187,12 +228,11 @@ async def handle_webhook_event(
 
     event = await session.get(WebhookEvent, payload.event_id, with_for_update=True)
     if event is not None and event.status not in RETRYABLE_EVENT_STATUSES:
-        booking_status = await _current_booking_status(session, event.booking_id)
         logger.info(
             "webhook_duplicate_ignored",
             extra={"event_id": payload.event_id, "stored_status": str(event.status)},
         )
-        return _stored_outcome(event, booking_status, duplicate=True)
+        return await _duplicate_outcome(session, event, payload)
 
     if event is None:
         claimed = await claim_event(
@@ -206,22 +246,23 @@ async def handle_webhook_event(
                     "event_type": payload.event_type,
                     "created_at": payload.created_at.isoformat() if payload.created_at else None,
                 },
-                signature_valid=bool(signature_valid),
+                signature_valid=signature_valid,
                 received_at=utcnow(),
             ),
         )
         if not claimed:
             stored = await session.get(WebhookEvent, payload.event_id)
-            booking_status = (
-                await _current_booking_status(session, stored.booking_id) if stored else None
-            )
+            if stored is None:
+                raise NotFoundError(
+                    "Webhook event could not be persisted.", code="event_not_found"
+                )
             logger.info("webhook_duplicate_ignored", extra={"event_id": payload.event_id})
-            return _stored_outcome(stored, booking_status, duplicate=True)
+            return await _duplicate_outcome(session, stored, payload)
         event = await session.get(WebhookEvent, payload.event_id)
     else:
         event.attempts += 1
         event.status = WebhookProcessingStatus.RECEIVED
-        event.signature_valid = bool(signature_valid)
+        event.signature_valid = signature_valid
         event.error = None
         await session.flush()
 
@@ -256,6 +297,8 @@ async def handle_webhook_event(
         ),
         failure_code=payload.data.get("failure_code"),
         failure_reason=payload.data.get("failure_reason"),
+        claimed_amount=payload.data.get("amount"),
+        claimed_currency=payload.data.get("currency"),
     )
 
     event.status = WebhookProcessingStatus.PROCESSED

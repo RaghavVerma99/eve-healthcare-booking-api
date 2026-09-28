@@ -126,6 +126,52 @@ def test_sliding_window_rate_limiter_resets() -> None:
     assert limiter.allow("a")[0] is True
 
 
+def test_sliding_window_rate_limiter_forgets_quiet_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client that stops calling must not be retained forever."""
+    from app.api import middleware as middleware_module
+    from app.api.middleware import SlidingWindowRateLimiter
+
+    now = [1_000.0]
+    monkeypatch.setattr(middleware_module.time, "monotonic", lambda: now[0])
+
+    limiter = SlidingWindowRateLimiter(limit=100, window_seconds=60)
+    for index in range(500):
+        limiter.allow(f"10.0.0.{index}")
+    assert len(limiter._hits) == 500
+
+    # Two windows later every one of those clients is idle and must be gone.
+    now[0] += 120
+    limiter.allow("10.0.0.0")
+    assert len(limiter._hits) == 1
+
+
+def test_rate_limiter_ignores_forwarded_headers_by_default() -> None:
+    """X-Forwarded-For is client-controlled, so it must not key the limiter."""
+    from app.api.middleware import RateLimitMiddleware
+    from starlette.datastructures import Headers
+    from starlette.requests import Request
+
+    def build(forwarded: str | None) -> Request:
+        raw_headers = Headers({"x-forwarded-for": forwarded} if forwarded else {})
+        return Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "headers": raw_headers.raw,
+                "client": ("10.1.2.3", 1234),
+            }
+        )
+
+    untrusted = RateLimitMiddleware(app=None, trust_proxy_headers=False)
+    assert untrusted._key(build("1.1.1.1")) == untrusted._key(build("2.2.2.2"))
+
+    trusted = RateLimitMiddleware(app=None, trust_proxy_headers=True)
+    assert trusted._key(build("1.1.1.1")) != trusted._key(build("2.2.2.2"))
+
+
 async def test_confirmed_booking_cannot_be_cancelled_by_user(
     client: AsyncClient, auth_headers, catalogue
 ) -> None:
@@ -137,11 +183,19 @@ async def test_confirmed_booking_cannot_be_cancelled_by_user(
     assert response.json()["error"]["code"] == "booking_not_cancellable"
 
 
-async def test_booking_delete_on_confirmed_booking_is_rejected(
+async def test_booking_delete_is_not_a_cancel_alias(
     client: AsyncClient, auth_headers, catalogue
 ) -> None:
+    """DELETE implies destroying a resource; a booking can only be cancelled.
+
+    Keeping a cancel behind DELETE returned 200 for a request that changed
+    nothing, so the route is gone rather than aliased.
+    """
     booking = await create_booking(client, auth_headers, catalogue)
-    await pay_booking(client, auth_headers, booking["id"])
 
     response = await client.delete(f"/bookings/{booking['id']}", headers=auth_headers)
-    assert response.status_code == 409
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
+
+    detail = await client.get(f"/bookings/{booking['id']}", headers=auth_headers)
+    assert detail.json()["status"] == "PENDING"

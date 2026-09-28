@@ -252,9 +252,83 @@ async def test_admin_can_read_any_booking(
     assert listing.json()["total"] == 1
 
 
-async def test_delete_booking_cancels(client: AsyncClient, auth_headers, catalogue) -> None:
+async def test_cancel_booking_requires_an_explicit_cancel_call(
+    client: AsyncClient, auth_headers, catalogue
+) -> None:
+    """DELETE is not an alias for cancel, so it must not mutate anything."""
     booking = await create_booking(client, auth_headers, catalogue)
-    response = await client.delete(f"/bookings/{booking['id']}", headers=auth_headers)
-    assert response.status_code == 200
-    detail = await client.get(f"/bookings/{booking['id']}", headers=auth_headers)
-    assert detail.json()["status"] == "CANCELLED"
+
+    deleted = await client.delete(f"/bookings/{booking['id']}", headers=auth_headers)
+    assert deleted.status_code == 405
+
+    cancelled = await client.post(f"/bookings/{booking['id']}/cancel", headers=auth_headers)
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "CANCELLED"
+
+
+async def test_sequential_double_booking_is_rejected(
+    client: AsyncClient, auth_headers, catalogue
+) -> None:
+    """The friendly pre-check: a second booking for a live slot is a 409."""
+    slot = future_appointment(hours=30)
+    await create_booking(client, auth_headers, catalogue, appointment_at=slot)
+
+    clash = await client.post(
+        "/bookings/",
+        json={
+            "test_id": str(catalogue["cbc"].id),
+            "centre_id": str(catalogue["centre"].id),
+            "appointment_at": slot,
+        },
+        headers=auth_headers,
+    )
+    assert clash.status_code == 409
+    assert clash.json()["error"]["code"] == "appointment_slot_taken"
+
+
+async def test_unique_index_blocks_double_booking_when_the_pre_check_is_blind(
+    client: AsyncClient, auth_headers, catalogue, monkeypatch
+) -> None:
+    """The authoritative guard, exercised the way a lost race would hit it.
+
+    `_slot_is_taken` cannot see a concurrent transaction that has not committed,
+    so both racers pass it. Disabling it reproduces exactly that state; the
+    request must still fail with the same 409, this time raised because the
+    database refused the row.
+    """
+    from app.services import booking_service
+
+    slot = future_appointment(hours=30)
+    await create_booking(client, auth_headers, catalogue, appointment_at=slot)
+
+    async def blind_to_the_race(*args, **kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(booking_service, "_slot_is_taken", blind_to_the_race)
+
+    clash = await client.post(
+        "/bookings/",
+        json={
+            "test_id": str(catalogue["cbc"].id),
+            "centre_id": str(catalogue["centre"].id),
+            "appointment_at": slot,
+        },
+        headers=auth_headers,
+    )
+    assert clash.status_code == 409
+    assert clash.json()["error"]["code"] == "appointment_slot_taken"
+
+    listing = await client.get("/bookings/", headers=auth_headers)
+    assert listing.json()["total"] == 1
+
+
+async def test_cancelling_a_booking_frees_the_slot(
+    client: AsyncClient, auth_headers, catalogue
+) -> None:
+    """The slot index only covers live statuses, so CANCELLED releases the slot."""
+    slot = future_appointment(hours=30)
+    first = await create_booking(client, auth_headers, catalogue, appointment_at=slot)
+    await client.post(f"/bookings/{first['id']}/cancel", headers=auth_headers)
+
+    second = await create_booking(client, auth_headers, catalogue, appointment_at=slot)
+    assert second["status"] == "PENDING"

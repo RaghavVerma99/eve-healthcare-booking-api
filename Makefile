@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lint format test test-postgres run migrate seed worker compose-up compose-down clean
+.PHONY: help install dev-install lint format test test-postgres run migrate seed worker beat compose-up compose-down clean
 
 VENV := .venv
 PY := $(VENV)/bin/python
@@ -49,7 +49,10 @@ seed: ## Seed centres, tests and the admin user
 worker: ## Start the Celery worker
 	$(VENV)/bin/celery -A app.worker.celery_app worker --loglevel=info -Q payments,default
 
-compose-up: ## Start the full stack (db, redis, migrate, seed, api, worker)
+beat: ## Start Celery beat (periodic booking/token maintenance)
+	$(VENV)/bin/celery -A app.worker.celery_app beat --loglevel=info
+
+compose-up: ## Start the full stack (db, redis, migrate, seed, api, worker, beat)
 	docker compose up --build
 
 compose-down: ## Stop the stack and remove volumes

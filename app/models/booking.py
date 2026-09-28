@@ -11,6 +11,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy import (
     Enum as SAEnum,
@@ -72,4 +73,17 @@ class Booking(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_bookings_user_created", "user_id", "created_at"),
         Index("ix_bookings_user_status", "user_id", "status"),
         Index("ix_bookings_centre_appointment", "centre_id", "appointment_at"),
+        # The application-level "is this slot taken?" check is a plain SELECT, so
+        # two concurrent requests can both pass it and both insert. This partial
+        # index is the authoritative guard: at most one live booking per centre
+        # per appointment slot. Cancelled and failed bookings release the slot,
+        # which is why the predicate restricts the index to live statuses.
+        Index(
+            "uq_bookings_active_slot",
+            "centre_id",
+            "appointment_at",
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'CONFIRMED')"),
+            sqlite_where=text("status IN ('PENDING', 'CONFIRMED')"),
+        ),
     )

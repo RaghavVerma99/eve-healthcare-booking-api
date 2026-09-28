@@ -49,6 +49,12 @@ class PermissionDeniedError(AppError):
     message = "You do not have permission to perform this action."
 
 
+class ServiceUnavailableError(AppError):
+    status_code = 503
+    code = "service_unavailable"
+    message = "A dependency this request needs is unavailable."
+
+
 class InvalidStateTransitionError(ConflictError):
     code = "invalid_state_transition"
     message = "The requested state transition is not allowed."

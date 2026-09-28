@@ -5,9 +5,10 @@ from fastapi import APIRouter, Header, Request, Response, status
 
 from app.api.deps import AdminUser, CurrentUser, SessionDep
 from app.core.config import settings
-from app.core.exceptions import AuthenticationError
+from app.core.exceptions import AuthenticationError, ServiceUnavailableError
 from app.core.logging_config import get_logger
 from app.core.security import verify_webhook_signature
+from app.schemas.common import MessageResponse
 from app.schemas.payment import (
     PaymentCreate,
     PaymentRead,
@@ -19,6 +20,7 @@ from app.schemas.payment import (
 from app.services import booking_service, payment_service, webhook_service
 from app.services.mock_gateway import mock_gateway
 from app.services.webhook_service import handle_webhook_event
+from app.worker import enqueue_replay
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["payments"])
@@ -57,7 +59,11 @@ async def create_payment(
         event_type=charge.event_type.value,
         data=data,
     )
-    outcome = await handle_webhook_event(session, event)
+    # `signature_valid=True` records the truth here: the event came from the
+    # in-process mock gateway, which is the trusted source. Recording `None` as
+    # False would look like a failed verification to the admin inspector and
+    # would make the replay task reject the event forever.
+    outcome = await handle_webhook_event(session, event, signature_valid=True)
     await session.commit()
 
     logger.info(
@@ -112,6 +118,7 @@ async def payment_webhook(
         status=str(outcome.status),
         duplicate=outcome.duplicate,
         booking_status=outcome.booking_status,
+        payment_id=outcome.payment_id,
     )
 
 
@@ -134,3 +141,33 @@ async def get_webhook_event(
 ) -> WebhookEventRead:
     event = await webhook_service.get_event(session, event_id)
     return WebhookEventRead.model_validate(event)
+
+
+@router.post(
+    "/payments/webhook/{event_id}/replay",
+    response_model=MessageResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Re-queue a stored event for processing (admin)",
+)
+async def replay_webhook_event(
+    event_id: str, session: SessionDep, admin: AdminUser
+) -> MessageResponse:
+    """Hand a stored event back to the worker.
+
+    The processor is idempotent, so replaying a settled event is a no-op. This
+    exists for the case the receiver could not finish on its own: an event
+    parked in FAILED once the underlying cause is fixed.
+    """
+    await webhook_service.get_event(session, event_id)
+    try:
+        task_id = enqueue_replay(event_id)
+    except Exception as exc:
+        logger.error(
+            "webhook_replay_enqueue_failed",
+            extra={"event_id": event_id, "error": str(exc), "error_type": type(exc).__name__},
+        )
+        raise ServiceUnavailableError(
+            "The task queue is unavailable. Start the worker, or replay the event directly.",
+            code="queue_unavailable",
+        ) from exc
+    return MessageResponse(message=f"Replay queued as task {task_id}.")

@@ -100,7 +100,17 @@ async def concurrent_client(engine) -> AsyncGenerator[AsyncClient, None]:
 @pytest_asyncio.fixture
 async def client(engine, session) -> AsyncGenerator[AsyncClient, None]:
     async def override_get_session():
-        yield session
+        try:
+            yield session
+        finally:
+            # In production every request gets its own session, which is closed
+            # (and so rolled back) when the request ends. This fixture shares one
+            # session, so a request that fails part-way through a write leaves it
+            # deactivated and the next request would see PendingRollbackError.
+            # Reviving it here keeps the shared session behaving like the
+            # per-request one it stands in for.
+            if not session.is_active:
+                await session.rollback()
 
     app.dependency_overrides[get_session] = override_get_session
     transport = ASGITransport(app=app)

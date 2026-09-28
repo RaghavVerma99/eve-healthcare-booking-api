@@ -31,6 +31,19 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_default_retry_delay=10,
     task_time_limit=60,
+    # Bookings are never auto-confirmed, so an abandoned PENDING booking would
+    # otherwise hold its slot forever. `celery -A app.worker.celery_app beat`
+    # runs this schedule; the API is unaffected when beat is not running.
+    beat_schedule={
+        "expire-stale-pending-bookings": {
+            "task": "bookings.expire_stale_pending",
+            "schedule": timedelta(minutes=15),
+        },
+        "purge-expired-refresh-tokens": {
+            "task": "auth.purge_expired_refresh_tokens",
+            "schedule": timedelta(hours=6),
+        },
+    },
 )
 
 
@@ -51,11 +64,15 @@ def expire_stale_pending_bookings(self) -> dict:
 async def _expire_stale_pending() -> dict:
     cutoff = utcnow() - timedelta(hours=24)
     async with SessionLocal() as session:
+        # skip_locked keeps this sweep off rows a payment request is currently
+        # holding, so expiring a booking can never race a payment confirming it.
         result = await session.execute(
-            select(Booking).where(
+            select(Booking)
+            .where(
                 Booking.status == BookingStatus.PENDING,
                 Booking.appointment_at < cutoff,
             )
+            .with_for_update(skip_locked=True)
         )
         bookings = list(result.scalars())
         for booking in bookings:
@@ -64,6 +81,21 @@ async def _expire_stale_pending() -> dict:
         await session.commit()
     logger.info("expired_stale_bookings", extra={"count": len(bookings)})
     return {"expired": len(bookings)}
+
+
+@celery_app.task(name="auth.purge_expired_refresh_tokens")
+def purge_expired_refresh_tokens() -> dict:
+    from app.services.auth_service import purge_expired_refresh_tokens as purge
+
+    return _run(_purge_refresh_tokens(purge))
+
+
+async def _purge_refresh_tokens(purge) -> dict:
+    async with SessionLocal() as session:
+        purged = await purge(session)
+        await session.commit()
+    logger.info("purged_refresh_tokens", extra={"count": purged})
+    return {"purged": purged}
 
 
 @celery_app.task(
@@ -106,36 +138,9 @@ async def _replay_webhook(event_id: str) -> dict:
     }
 
 
-@celery_app.task(name="webhooks.dispatch", bind=True, max_retries=5, default_retry_delay=15)
-def dispatch_webhook_event(self, payload: dict) -> dict:
-    return _run(_dispatch_webhook_event(payload))
-
-
-async def _dispatch_webhook_event(payload: dict) -> dict:
-    from app.services.webhook_service import handle_webhook_event
-
-    try:
-        event = WebhookEventIn.model_validate(payload)
-    except ValueError as exc:
-        logger.warning("webhook_payload_invalid", extra={"error": str(exc)})
-        return {"status": "rejected", "reason": str(exc)}
-
-    async with SessionLocal() as session:
-        outcome = await handle_webhook_event(session, event)
-        await session.commit()
-    return {
-        "status": str(outcome.status),
-        "event_id": outcome.event_id,
-        "duplicate": outcome.duplicate,
-        "booking_status": outcome.booking_status,
-    }
-
-
-def enqueue_webhook(payload: dict, *, queue: str = "payments") -> str | None:
-    if not settings.redis_url:
-        logger.info("celery_disabled_no_broker", extra={"event_id": payload.get("event_id")})
-        return None
-    task = dispatch_webhook_event.apply_async(kwargs={"payload": payload}, queue=queue)
+def enqueue_replay(event_id: str, *, queue: str = "payments") -> str:
+    """Queue a replay of a stored event. Raises if the broker is unreachable."""
+    task = replay_webhook.apply_async(kwargs={"event_id": event_id}, queue=queue)
     return str(task.id)
 
 

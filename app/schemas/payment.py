@@ -66,6 +66,13 @@ class WebhookAck(BaseModel):
     status: str
     duplicate: bool = False
     booking_status: str | None = None
+    payment_id: uuid.UUID | None = None
+    """The payment this acknowledgement describes.
+
+    On a repeat delivery this is the payment named in *this* request, not the
+    one the first delivery referenced, so a provider that recycles an
+    `event_id` is not told its new payment was settled when it was not.
+    """
 
 
 class WebhookEventRead(ORMModel):
@@ -76,7 +83,9 @@ class WebhookEventRead(ORMModel):
     result: str | None = None
     error: str | None = None
     attempts: int
-    signature_valid: bool
+    signature_valid: bool | None = None
+    """True when a signature verified, False when one was rejected, null when
+    signature checking was not enabled for this delivery."""
     booking_id: uuid.UUID | None = None
     payment_id: uuid.UUID | None = None
     received_at: datetime

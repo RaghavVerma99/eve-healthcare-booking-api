@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import AuthenticationError, ConflictError, NotFoundError
+from app.core.exceptions import AuthenticationError, ConflictError
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -184,10 +184,3 @@ async def purge_expired_refresh_tokens(session: AsyncSession) -> int:
     for token in tokens:
         await session.delete(token)
     return len(tokens)
-
-
-async def require_user(session: AsyncSession, user_id: uuid.UUID) -> User:
-    user = await session.get(User, user_id)
-    if user is None:
-        raise NotFoundError("User not found.", code="user_not_found")
-    return user

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query, Response, status
 from app.api.deps import CurrentUser, PaginationDep, SessionDep
 from app.models.enums import BookingStatus
 from app.schemas.booking import BookingCreate, BookingDetail, BookingRead
-from app.schemas.common import MessageResponse, Page
+from app.schemas.common import Page
 from app.schemas.payment import PaymentRead
 from app.services import booking_service, payment_service
 
@@ -95,17 +95,3 @@ async def list_booking_payments(
     booking = await booking_service.get_booking(session, booking_id, user=user)
     payments = await payment_service.list_payments_for_booking(session, booking)
     return [PaymentRead.model_validate(payment) for payment in payments]
-
-
-@router.delete(
-    "/{booking_id}",
-    response_model=MessageResponse,
-    summary="Cancel a booking (alias of POST /bookings/{id}/cancel)",
-)
-async def delete_booking(
-    booking_id: uuid.UUID, session: SessionDep, user: CurrentUser
-) -> MessageResponse:
-    booking = await booking_service.get_booking(session, booking_id, user=user, for_update=True)
-    await booking_service.cancel_booking(session, booking, reason="cancelled by user")
-    await session.commit()
-    return MessageResponse(message="Booking cancelled.")

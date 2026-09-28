@@ -32,7 +32,11 @@ class WebhookEvent(TimestampMixin, Base):
         Uuid(as_uuid=True), ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True
     )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False)
-    signature_valid: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Nullable on purpose: NULL means "signature checking was not enabled for
+    # this delivery", which is not the same as False ("verified and rejected").
+    # Collapsing the two would make every unsigned delivery look like an attack
+    # and would stop the replay task from ever re-processing it.
+    signature_valid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     status: Mapped[WebhookProcessingStatus] = mapped_column(
         SAEnum(
             WebhookProcessingStatus,

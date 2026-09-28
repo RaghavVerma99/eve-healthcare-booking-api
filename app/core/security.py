@@ -96,5 +96,11 @@ def sign_webhook_payload(raw_body: bytes) -> str:
 def verify_webhook_signature(raw_body: bytes, signature: str | None) -> bool:
     if not signature:
         return False
-    expected = sign_webhook_payload(raw_body)
-    return hmac.compare_digest(expected, signature.strip().lower())
+    # Providers conventionally send the algorithm as a prefix, so `sha256=<hex>`
+    # and a bare `<hex>` both have to verify against the same digest.
+    candidate = signature.strip().lower()
+    for prefix in ("sha256=", "hmac-sha256="):
+        if candidate.startswith(prefix):
+            candidate = candidate[len(prefix) :]
+            break
+    return hmac.compare_digest(sign_webhook_payload(raw_body), candidate)

@@ -1,0 +1,222 @@
+================================================================================
+EVE DIAGNOSTICS BOOKING API - PROJECT SUMMARY
+================================================================================
+
+A short overview for reviewers. The full design rationale, endpoint reference,
+state machines and production notes are in README.md.
+
+Stack: FastAPI, async SQLAlchemy 2, Alembic, PostgreSQL (asyncpg), Redis,
+Celery, Pydantic v2, JWT auth.
+
+
+--------------------------------------------------------------------------------
+1. WHAT IT DOES
+--------------------------------------------------------------------------------
+
+Backend service for booking diagnostic tests at healthcare centres, with a
+simulated payment gateway and an idempotent webhook receiver.
+
+Covers the assignment end to end: authentication, a centre/test catalogue,
+bookings, simulated payments, and a webhook receiver that is safe to replay and
+safe under concurrent delivery.
+
+
+--------------------------------------------------------------------------------
+2. KEY POINTS
+--------------------------------------------------------------------------------
+
+AUTHENTICATION
+  * JWT access tokens plus long-lived, single-use refresh tokens.
+  * Only the token's "jti" is persisted, never the token itself, so a database
+    leak yields material that cannot be used as a credential.
+  * Refresh rotation is tracked as a token family. Presenting a token that was
+    already rotated past returns 401 refresh_token_reuse_detected and revokes
+    the whole family, so a stolen token cannot stay valid.
+  * A replayed token from an explicit logout is treated as benign, not as theft.
+
+CATALOGUE
+  * Diagnostic centres and tests, with per-centre price overrides and
+    availability, paginated, with Redis caching and invalidation on every
+    mutation.
+
+BOOKINGS
+  * Explicit state machine: PENDING -> CONFIRMED / FAILED / CANCELLED, validated
+    by transition maps rather than silently mutating state.
+  * A centre slot can hold one live booking. A read for a conflicting slot gives
+    a clear 409, but it cannot see an uncommitted concurrent insert, so the
+    authoritative guard is a partial unique index over PENDING and CONFIRMED.
+    The losing request surfaces as the same 409 from a caught IntegrityError.
+    Cancelling or failing a booking releases its slot.
+  * A confirmed booking cannot be cancelled by its owner; money is captured, so
+    that is a refund concern.
+  * A failed payment is retryable, so a declined payment does not force a
+    rebooking. Every attempt is kept as history.
+  * The price is snapshotted at booking time, so later catalogue changes never
+    rewrite existing bookings.
+  * Cancelling is not deleting: DELETE /bookings/{id} returns 405, so no request
+    can report success for quietly cancelling instead.
+
+PAYMENTS AND WEBHOOK IDEMPOTENCY
+  * POST /payments/ runs the same internal path as the webhook, so both behave
+    identically.
+  * The event is claimed with INSERT ... ON CONFLICT DO NOTHING, then re-read
+    under SELECT ... FOR UPDATE. Duplicates return duplicate: true and change
+    nothing.
+  * A duplicate acknowledgement is resolved from the request being answered, not
+    from the first delivery, so a recycled event_id reports the payment the
+    caller asked about instead of the one that happened to arrive first.
+  * Amount and currency quoted by the provider are reconciled against what was
+    charged; a mismatch is 422 and leaves the payment unchanged.
+  * A PostgreSQL partial unique index (WHERE status = 'SUCCESS') makes a second
+    successful capture for one booking impossible at the database level.
+  * Money is NUMERIC(10,2), handled as Decimal end to end.
+
+OPERATIONAL
+  * One consistent error envelope with a request_id that also appears in the
+    X-Request-ID header and the structured logs.
+  * Request IDs, structured JSON logging, sliding-window rate limiting.
+  * Webhook signatures are required by default; the signature column records
+    verified / rejected / not-checked distinctly.
+  * Celery worker plus beat for periodic maintenance, and an admin endpoint to
+    replay a parked webhook.
+  * Alembic migrations, idempotent seed script, Dockerfile, Compose stack and
+    Makefile targets.
+
+TESTING
+  * 150 tests, passing on SQLite and PostgreSQL.
+  * PostgreSQL is the target. SQLite silently ignores SELECT ... FOR UPDATE and
+    cannot host the partial index on captured payments, so a SQLite-only pass
+    would hide real concurrency bugs. Concurrency tests give every request its
+    own session.
+  * The double-booking guard is declared for both dialects, so it is covered by
+    the default run: with the advisory pre-check blinded, a second insert for a
+    held slot is still refused and the centre keeps one live booking.
+  * Verified against a live PostgreSQL instance: 12 concurrent deliveries of one
+    event id produce 1 applied update, 11 duplicate responses, 1 event row and 1
+    payment, and inserting a second SUCCESS payment directly in SQL is rejected
+    by the unique index.
+
+
+--------------------------------------------------------------------------------
+3. SETUP
+--------------------------------------------------------------------------------
+
+WHOLE STACK (Postgres, Redis, migrations, seed, API, worker, beat)
+
+    cp .env.example .env
+    make compose-up          # or: docker compose up --build
+
+    API on http://localhost:8000, Swagger at /docs
+    Migrations and seeding run before the API starts.
+
+LOCAL, NO POSTGRESQL OR DOCKER REQUIRED
+
+    make dev-install
+    cp .env.example .env
+    sed -i 's|^DATABASE_URL=.*|DATABASE_URL="sqlite+aiosqlite:///./dev.db"|' .env
+    make migrate && make seed && make run
+
+    Migrations and the seed script both handle SQLite.
+
+SEEDED CREDENTIALS
+
+    Admin   admin@eve.health / Admin@12345
+
+TESTS
+
+    make test                                        # SQLite, 150 tests
+    make lint                                        # ruff: app, tests, alembic
+    make test-postgres                               # same suite on PostgreSQL
+    make test-postgres TEST_PG_URL=<url>              # override the target
+
+    For test-postgres the suite creates and drops its own schema, so point it at
+    an empty database. Compose only creates eve_diagnostics, so create the test
+    database once:
+        createdb -U eve eve_diagnostics_test
+
+    make help lists every target.
+
+
+--------------------------------------------------------------------------------
+4. KEY ASSUMPTIONS
+--------------------------------------------------------------------------------
+
+The assignment left these open. These are the calls made and why.
+
+1.  Payment is what confirms a booking. Bookings start PENDING rather than being
+    auto-confirmed, and a Celery beat schedule (bookings.expire_stale_pending,
+    every 15 minutes) ages out abandoned ones so a slot frees itself. Without a
+    worker running, unpaid bookings stay PENDING until one does.
+
+2.  FAILED is retryable, CANCELLED is terminal. A declined payment should not
+    force the user to rebook, so a failed booking can be paid again and the
+    attempt history is preserved.
+
+3.  A user may not cancel a CONFIRMED booking. Money is captured, so
+    cancellation is a refund concern rather than a booking concern. The
+    suggested CANCELLED state is treated as reachable via refund, which the
+    webhook path handles.
+
+4.  Price is a property of the centre, not the test. A test has a base price and
+    each centre may override it; bookings snapshot the resolved price.
+
+5.  The webhook "data" shape is not specified, so the receiver is flexible. The
+    target payment is resolved by payment_id, then provider +
+    provider_payment_id, then booking_reference, then booking_id. An event
+    naming no payment we can resolve is a 404 payment_not_found with nothing
+    written; an IGNORED status was removed because no code path ever assigned it.
+
+6.  Only the three required event types are accepted (payment.succeeded,
+    payment.failed, payment.refunded). Unknown types are a 422 rather than being
+    silently swallowed.
+
+7.  Amounts are trusted from the server, never the client. The payment amount is
+    read from the booking and currency is fixed to INR.
+
+8.  Signup returns a token pair. The brief only requires signup and login, but
+    making a new user immediately call login is poor UX.
+
+9.  Refresh tokens are persisted, not stateless, because that is what makes
+    rotation and revocation possible. Only the jti is stored, and each rotation
+    inherits a family_id so reuse of a superseded token can burn exactly that
+    login chain.
+
+10. Authorization never trusts a token claim. is_admin is carried in the access
+    token as display metadata only; the user is reloaded from the database on
+    every request, so deactivating an account or revoking admin takes effect
+    immediately instead of waiting out the token lifetime.
+
+11. SQLite is a development convenience; PostgreSQL is the target. On PostgreSQL
+    both guards are database-enforced: the partial unique index on live booking
+    slots and the one on captured payments. SQLite hosts the slot index too, so
+    that guarantee is covered by the default run; it cannot host the payment
+    index, so that one is application-enforced there.
+
+12. Rate limiting and caching are per process. Correct for a single replica, and
+    documented as a limitation rather than silently assumed away. The rate-limit
+    key is the peer address, not a forwarded header, since a client can set
+    X-Forwarded-For itself.
+
+
+--------------------------------------------------------------------------------
+5. KNOWN LIMITATIONS
+--------------------------------------------------------------------------------
+
+Stated plainly rather than left for a reviewer to find:
+
+  * Docker and Compose have not been executed in the authoring environment and
+    are therefore unverified at runtime, though both are statically reviewed and
+    the same code paths are verified against a real PostgreSQL instance and a
+    locally booted app.
+  * Rate limiting and caching are in-process. A multi-worker deployment needs
+    both moved to Redis or a gateway.
+  * Idempotency keys are matched on the key alone, so reusing a key with a
+    different body returns the original resource rather than a 409. Comparing a
+    request fingerprint would be stricter.
+  * Tokens are signed with a single symmetric JWT_SECRET_KEY, so there is no kid
+    and no way to roll the key without invalidating every session.
+  * Payment initiation writes the payment row and the simulated event in one
+    transaction, which suits an in-process mock. A real gateway would need a
+    transactional outbox.
+
+================================================================================

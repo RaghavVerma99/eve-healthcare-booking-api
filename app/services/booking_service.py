@@ -3,10 +3,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import Select, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
 from app.core.exceptions import (
+    AppError,
     ConflictError,
     InvalidStateTransitionError,
     NotFoundError,
@@ -40,6 +42,24 @@ def _base_query() -> Select:
         joinedload(Booking.test),
         joinedload(Booking.centre),
     )
+
+
+async def _slot_is_taken(
+    session: AsyncSession, centre_id: uuid.UUID, appointment_at: datetime
+) -> bool:
+    """Advisory check, so a clash produces a clear 409 instead of a constraint error.
+
+    It cannot see a concurrent transaction that has not committed, which is why
+    `uq_bookings_active_slot` is the real guard.
+    """
+    clash = await session.scalar(
+        select(Booking.id).where(
+            Booking.centre_id == centre_id,
+            Booking.appointment_at == appointment_at,
+            Booking.status.in_([BookingStatus.PENDING, BookingStatus.CONFIRMED]),
+        )
+    )
+    return clash is not None
 
 
 async def create_booking(
@@ -97,14 +117,7 @@ async def create_booking(
             code="test_not_offered_at_centre",
         )
 
-    clash = await session.scalar(
-        select(Booking.id).where(
-            Booking.centre_id == centre_id,
-            Booking.appointment_at == appointment_at,
-            Booking.status.in_([BookingStatus.PENDING, BookingStatus.CONFIRMED]),
-        )
-    )
-    if clash is not None:
+    if await _slot_is_taken(session, centre_id, appointment_at):
         raise ConflictError(
             "The centre already has a booking at that exact appointment time.",
             code="appointment_slot_taken",
@@ -122,8 +135,43 @@ async def create_booking(
         idempotency_key=payload.idempotency_key,
     )
     session.add(booking)
-    await session.flush()
+    # The clash read above is advisory: it cannot see a concurrent transaction
+    # that has not committed yet, so two requests for the same slot can both
+    # pass it. `uq_bookings_active_slot` is the real guard, which means the
+    # loser of that race discovers it here rather than silently double-booking.
+    # The nested block keeps the failed INSERT from poisoning the transaction.
+    try:
+        async with session.begin_nested():
+            await session.flush()
+    except IntegrityError as exc:
+        raise _translate_booking_integrity_error(exc) from exc
     return booking, False
+
+
+def _translate_booking_integrity_error(exc: IntegrityError) -> AppError:
+    """Map a losing race or a bad reference to a specific client error.
+
+    The other IntegrityErrors reachable here are the unique booking reference
+    and the unique idempotency key, both of which are conflicts rather than
+    server faults.
+    """
+    message = str(exc.orig).lower()
+    if "uq_bookings_active_slot" in message or "appointment_at" in message:
+        return ConflictError(
+            "The centre already has a booking at that exact appointment time.",
+            code="appointment_slot_taken",
+        )
+    if "uq_bookings_idempotency_key" in message or "idempotency_key" in message:
+        return ConflictError(
+            "A booking with this idempotency key already exists.",
+            code="duplicate_idempotency_key",
+        )
+    if "reference" in message:
+        return ConflictError(
+            "Could not allocate a unique booking reference. Please retry.",
+            code="reference_collision",
+        )
+    return ConflictError("The booking conflicts with an existing record.")
 
 
 async def get_booking(
