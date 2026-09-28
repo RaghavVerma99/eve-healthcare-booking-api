@@ -99,6 +99,28 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce a value out of pydantic's error dict into something json.dumps accepts.
+
+    `exc.errors()` carries the offending `input` verbatim, and for a body that
+    failed to parse that input is the raw request body as `bytes`. Returning it
+    unchanged made json.dumps raise inside the error handler, so the handler
+    itself failed: a malformed request got a 500 and a stack trace instead of
+    the 422 it should have, and the client learned nothing about what was wrong.
+    """
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    if isinstance(value, bytes | bytearray):
+        # Deliberately not echoed back. A body that fails to parse can be a
+        # password, and a 422 is not the place to reflect it.
+        return f"<{len(value)} bytes of unparseable body>"
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return f"<{type(value).__name__}>"
+
+
 def _safe_errors(errors: list[dict]) -> list[dict]:
     cleaned = []
     for error in errors:
@@ -107,7 +129,7 @@ def _safe_errors(errors: list[dict]) -> list[dict]:
         ctx = error.get("ctx")
         if isinstance(ctx, dict) and "error" in ctx:
             item["msg"] = str(ctx["error"])
-        cleaned.append(item)
+        cleaned.append(_json_safe(item))
     return cleaned
 
 

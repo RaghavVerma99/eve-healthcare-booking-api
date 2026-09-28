@@ -193,21 +193,21 @@ jq '{payment: .payment.status, booking: .booking_status, event: .webhook.event_i
 
 # 5. A provider retry of the same event is safe: replay it verbatim.
 #    Signatures are required by default, so sign the exact bytes you send.
+#    The key is read from your .env, so it cannot drift from what the server
+#    actually loaded.
+export WEBHOOK_SIGNING_SECRET=$(grep '^WEBHOOK_SIGNING_SECRET=' .env | cut -d= -f2- | tr -d '"')
 BODY=$(jq -c .webhook payment.json)
 SIG=$(printf '%s' "$BODY" | python3 -c \
   'import hashlib,hmac,os,sys; print(hmac.new(os.environ["WEBHOOK_SIGNING_SECRET"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
 
 curl -s -X POST $BASE/payments/webhook/ -H 'Content-Type: application/json' \
-  -H "X-Signature: sha256=$SIG" -d "$BODY" | jq '{event_id, duplicate, booking_status}'
-# { "event_id": "evt_...", "duplicate": true, "booking_status": "CONFIRMED" }
+  -H "X-Signature: sha256=$SIG" -d "$BODY" | jq '{event_id, duplicate, booking_status, payment_id}'
+# { "event_id": "evt_...", "duplicate": true, "booking_status": "CONFIRMED", "payment_id": "..." }
 ```
 
-Export the secret first, since the signature has to be computed with the same
-key the receiver holds:
-
-```bash
-export WEBHOOK_SIGNING_SECRET=mockpay-webhook-secret   # the .env.example default
-```
+`X-Signature` takes a bare hex digest or the `sha256=<hex>` prefix, either way
+round, and the signature must cover the exact bytes sent, so sign the string you
+pass to `-d` rather than re-serialising the JSON.
 
 Set `WEBHOOK_REQUIRE_SIGNATURE=false` to drop the header while experimenting;
 the receiver is unauthenticated, so the default is on.

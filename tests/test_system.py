@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from httpx import AsyncClient
 from tests.helpers import create_booking, pay_booking
@@ -199,3 +201,51 @@ async def test_booking_delete_is_not_a_cancel_alias(
 
     detail = await client.get(f"/bookings/{booking['id']}", headers=auth_headers)
     assert detail.json()["status"] == "PENDING"
+
+
+async def test_malformed_json_body_returns_422_not_500(client: AsyncClient) -> None:
+    """A body that cannot be parsed must not break the error handler itself.
+
+    Pydantic puts the offending input in the error dict, and for an unparseable
+    body that value is raw `bytes`. Passing it straight to JSONResponse made
+    json.dumps raise inside the handler, so the request returned 500 with a
+    stack trace instead of the 422 that describes the actual problem.
+    """
+    response = await client.post(
+        "/auth/login",
+        content=b'{"email": "admin@eve.health", "password": "Admin@12345"}',
+        headers={"Content-Type": "text/plain"},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert body["request_id"]
+
+    # The response must be serialisable end to end, and must not echo the body
+    # back, since a body that fails to parse can be a password.
+    detail = json.dumps(body)
+    assert "Admin@12345" not in detail
+    assert "unparseable body" in detail
+
+
+async def test_truncated_json_body_returns_422(client: AsyncClient) -> None:
+    response = await client.post(
+        "/auth/login",
+        content=b'{"email": "admin@eve.health", "passwor',
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_validation_error_still_names_the_offending_field(
+    client: AsyncClient,
+) -> None:
+    """Sanitising the error payload must not lose the useful part of it."""
+    response = await client.post(
+        "/auth/signup", json={"email": "not-an-email", "password": "Str0ngPass"}
+    )
+    assert response.status_code == 422
+    details = response.json()["error"]["details"]
+    assert details[0]["loc"] == ["body", "email"]
+    assert details[0]["type"] == "value_error"
